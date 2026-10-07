@@ -1306,6 +1306,28 @@ void UpdateOsdContent(HWND hwnd, const TrackSnapshot& snapshot) {
     SetWindowPos(hwnd, HWND_TOPMOST, g_currentLayout.x, g_currentLayout.y,
                  g_currentLayout.width, g_currentLayout.height, SWP_NOACTIVATE);
 
+    // Our own D2D drawing already leaves the corners of the bitmap fully
+    // transparent, but the window's DWM-level shape (backdrop/Mica
+    // painting, drop shadow, hit-testing) is still the full rectangle
+    // unless told otherwise -- DWMSBT_TRANSIENTWINDOW paints its blur
+    // material behind the whole rectangular frame, which shows through
+    // our transparent corners as a square patch extending past the
+    // rounded card. Setting an actual window region makes DWM treat the
+    // window's shape as the rounded rect too, so the backdrop (and
+    // shadow) get clipped to match what we draw. SetWindowRgn takes
+    // ownership of the HRGN on success; it must only be freed manually if
+    // the call fails.
+    float cornerRadiusPhysical = g_currentCornerRadiusDip * (dpi / 96.0f);
+    int diameter = static_cast<int>(cornerRadiusPhysical * 2.0f);
+    HRGN region = CreateRoundRectRgn(0, 0, g_currentLayout.width + 1,
+                                      g_currentLayout.height + 1, diameter,
+                                      diameter);
+    if (region) {
+        if (!SetWindowRgn(hwnd, region, TRUE)) {
+            DeleteObject(region);
+        }
+    }
+
     PaintOsdContent(hwnd, g_currentLayout, g_currentPalette, g_currentSnapshot,
                     g_currentAlpha, g_currentDpi, g_hoveredButton,
                     g_currentCornerRadiusDip);
