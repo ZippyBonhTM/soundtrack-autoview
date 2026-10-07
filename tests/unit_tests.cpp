@@ -234,6 +234,16 @@ static void Test_OsdTimingController_RetriggerAfterHideReplaysFadeIn() {
     CHECK(result.shouldPlayFadeIn);
 }
 
+static void Test_ShouldShowPanel_TrueWhenSnapshotPresent() {
+    TrackSnapshot snapshot;
+    snapshot.title = L"Falling Down - Bonus Track";
+    CHECK(ShouldShowPanel(std::optional<TrackSnapshot>(snapshot)));
+}
+
+static void Test_ShouldShowPanel_FalseWhenNoSession() {
+    CHECK(!ShouldShowPanel(std::optional<TrackSnapshot>()));
+}
+
 int main() {
     Test_HarnessSmokeTest();
     Test_TryParseHexColor_ValidSixDigit();
@@ -265,6 +275,8 @@ int main() {
     Test_OsdTimingController_HoverPausesCountdown();
     Test_OsdTimingController_MouseLeaveResumesFromFullDuration();
     Test_OsdTimingController_RetriggerAfterHideReplaysFadeIn();
+    Test_ShouldShowPanel_TrueWhenSnapshotPresent();
+    Test_ShouldShowPanel_FalseWhenNoSession();
 
     wprintf(L"\n%d/%d tests passed\n", g_testsRun - g_testsFailed, g_testsRun);
     return g_testsFailed == 0 ? 0 : 1;

@@ -59,6 +59,9 @@ key" — this is also what Windows' own native flyout relies on).
 
 #include <windows.h>
 #include <string>
+#include <optional>
+#include <vector>
+#include <cstdint>
 
 // ---------------------------------------------------------------------------
 // Pure logic (unit-tested via tests/unit_tests.cpp, which #includes this
@@ -315,6 +318,26 @@ private:
     double correctionDeadlineSeconds_ = 0.0;
 };
 
+enum class PlaybackState {
+    Unknown,
+    Playing,
+    Paused,
+    Stopped,
+};
+
+struct TrackSnapshot {
+    std::wstring title;
+    std::wstring artist;
+    PlaybackState status = PlaybackState::Unknown;
+    std::vector<uint8_t> artPixelsBgra;  // empty if there's no/failed art
+    int artWidth = 0;
+    int artHeight = 0;
+};
+
+inline bool ShouldShowPanel(const std::optional<TrackSnapshot>& snapshot) {
+    return snapshot.has_value();
+}
+
 // ---------------------------------------------------------------------------
 // Windhawk mod entry points and OS-integration code. Excluded from the unit
 // test build since they depend on the Windhawk engine (Wh_* functions) and
@@ -406,6 +429,149 @@ void UninstallKeyboardHook() {
     if (g_keyboardHook) {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
+    }
+}
+
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.Control.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <wincodec.h>
+#include <shcore.h>
+
+using winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession;
+using winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+using winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus;
+using winrt::Windows::Storage::Streams::IRandomAccessStreamReference;
+
+static GlobalSystemMediaTransportControlsSessionManager g_sessionManager{nullptr};
+
+static bool EnsureSessionManager() {
+    if (g_sessionManager) {
+        return true;
+    }
+    try {
+        g_sessionManager =
+            GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+        return true;
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"SoundTrackAutoView: failed to get session manager: %s",
+               ex.message().c_str());
+        return false;
+    }
+}
+
+static PlaybackState ToPlaybackState(
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus status) {
+    switch (status) {
+        case GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing:
+            return PlaybackState::Playing;
+        case GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused:
+            return PlaybackState::Paused;
+        case GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped:
+            return PlaybackState::Stopped;
+        default:
+            return PlaybackState::Unknown;
+    }
+}
+
+static bool TryDecodeThumbnail(IRandomAccessStreamReference const& thumbnailRef,
+                                std::vector<uint8_t>& outPixelsBgra, int& outWidth,
+                                int& outHeight) {
+    try {
+        auto stream = thumbnailRef.OpenReadAsync().get();
+
+        winrt::com_ptr<IStream> comStream;
+        winrt::check_hresult(CreateStreamOverRandomAccessStream(
+            winrt::get_unknown(stream), IID_PPV_ARGS(comStream.put())));
+
+        winrt::com_ptr<IWICImagingFactory> wicFactory;
+        winrt::check_hresult(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                               CLSCTX_INPROC_SERVER,
+                                               IID_PPV_ARGS(wicFactory.put())));
+
+        winrt::com_ptr<IWICBitmapDecoder> decoder;
+        winrt::check_hresult(wicFactory->CreateDecoderFromStream(
+            comStream.get(), nullptr, WICDecodeMetadataCacheOnDemand,
+            decoder.put()));
+
+        winrt::com_ptr<IWICBitmapFrameDecode> frame;
+        winrt::check_hresult(decoder->GetFrame(0, frame.put()));
+
+        winrt::com_ptr<IWICFormatConverter> converter;
+        winrt::check_hresult(wicFactory->CreateFormatConverter(converter.put()));
+        winrt::check_hresult(converter->Initialize(
+            frame.get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone,
+            nullptr, 0.0, WICBitmapPaletteTypeCustom));
+
+        UINT width = 0, height = 0;
+        winrt::check_hresult(converter->GetSize(&width, &height));
+
+        outPixelsBgra.resize(static_cast<size_t>(width) * height * 4);
+        winrt::check_hresult(converter->CopyPixels(
+            nullptr, width * 4, static_cast<UINT>(outPixelsBgra.size()),
+            outPixelsBgra.data()));
+
+        outWidth = static_cast<int>(width);
+        outHeight = static_cast<int>(height);
+        return true;
+    } catch (const winrt::hresult_error&) {
+        return false;
+    }
+}
+
+std::optional<TrackSnapshot> TryGetCurrentTrackSnapshot() {
+    if (!EnsureSessionManager()) {
+        return std::nullopt;
+    }
+
+    auto session = g_sessionManager.GetCurrentSession();
+    if (!session) {
+        return std::nullopt;
+    }
+
+    try {
+        TrackSnapshot snapshot;
+
+        auto playbackInfo = session.GetPlaybackInfo();
+        snapshot.status = ToPlaybackState(playbackInfo.PlaybackStatus());
+
+        auto properties = session.TryGetMediaPropertiesAsync().get();
+        snapshot.title = properties.Title().c_str();
+        snapshot.artist = properties.Artist().c_str();
+
+        auto thumbnailRef = properties.Thumbnail();
+        if (thumbnailRef) {
+            TryDecodeThumbnail(thumbnailRef, snapshot.artPixelsBgra,
+                                snapshot.artWidth, snapshot.artHeight);
+        }
+
+        return snapshot;
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"SoundTrackAutoView: failed to read session state: %s",
+               ex.message().c_str());
+        return std::nullopt;
+    }
+}
+
+void SendPlayPauseCommand() {
+    if (!EnsureSessionManager()) return;
+    if (auto session = g_sessionManager.GetCurrentSession()) {
+        session.TryTogglePlayPauseAsync();
+    }
+}
+
+void SendNextTrackCommand() {
+    if (!EnsureSessionManager()) return;
+    if (auto session = g_sessionManager.GetCurrentSession()) {
+        session.TrySkipNextAsync();
+    }
+}
+
+void SendPreviousTrackCommand() {
+    if (!EnsureSessionManager()) return;
+    if (auto session = g_sessionManager.GetCurrentSession()) {
+        session.TrySkipPreviousAsync();
     }
 }
 
