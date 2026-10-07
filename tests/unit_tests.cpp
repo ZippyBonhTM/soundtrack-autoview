@@ -112,6 +112,68 @@ static void Test_BuildSettings_UnknownThemeDefaultsToAuto() {
     CHECK(settings.theme == ThemeMode::Auto);
 }
 
+static void Test_ComputePanelPosition_StandardDpi() {
+    RECT workArea{0, 0, 1920, 1040};
+    PanelLayout layout = ComputePanelPosition(workArea, 96);
+    CHECK(layout.width == 360);
+    CHECK(layout.height == 100);
+    CHECK(layout.x == 1920 - 360 - 12);
+    CHECK(layout.y == 1040 - 100 - 12);
+}
+
+static void Test_ComputePanelPosition_ScaledDpi() {
+    RECT workArea{0, 0, 3840, 2080};
+    PanelLayout layout = ComputePanelPosition(workArea, 144);  // 150%
+    CHECK(layout.width == 540);
+    CHECK(layout.height == 150);
+    CHECK(layout.x == 3840 - 540 - 18);
+}
+
+static void Test_ComputePanelPosition_SecondMonitorOffset() {
+    RECT workArea{1920, 0, 3840, 1040};  // monitor to the right, non-zero origin
+    PanelLayout layout = ComputePanelPosition(workArea, 96);
+    CHECK(layout.x == 3840 - 360 - 12);
+    CHECK(layout.x > 1920);
+}
+
+static void Test_ComputePanelPosition_ClampsOnTinyWorkArea() {
+    RECT workArea{0, 0, 300, 80};
+    PanelLayout layout = ComputePanelPosition(workArea, 96);
+    CHECK(layout.x == 0);   // would be negative otherwise, clamped to workArea.left
+    CHECK(layout.y == 0);   // would be negative otherwise, clamped to workArea.top
+}
+
+static void Test_ComputeButtonLayout_ThreeDistinctRegions() {
+    PanelLayout panel{0, 0, 360, 100};
+    ButtonLayout buttons = ComputeButtonLayout(panel);
+    CHECK(buttons.previous.left < buttons.playPause.left);
+    CHECK(buttons.playPause.left < buttons.next.left);
+}
+
+static void Test_HitTestButton_InsideEachButton() {
+    PanelLayout panel{0, 0, 360, 100};
+    ButtonLayout buttons = ComputeButtonLayout(panel);
+
+    POINT centerOfPlayPause{(buttons.playPause.left + buttons.playPause.right) / 2,
+                             (buttons.playPause.top + buttons.playPause.bottom) / 2};
+    CHECK(HitTestButton(buttons, centerOfPlayPause) == OsdButton::PlayPause);
+
+    POINT centerOfPrevious{(buttons.previous.left + buttons.previous.right) / 2,
+                            (buttons.previous.top + buttons.previous.bottom) / 2};
+    CHECK(HitTestButton(buttons, centerOfPrevious) == OsdButton::Previous);
+
+    POINT centerOfNext{(buttons.next.left + buttons.next.right) / 2,
+                        (buttons.next.top + buttons.next.bottom) / 2};
+    CHECK(HitTestButton(buttons, centerOfNext) == OsdButton::Next);
+}
+
+static void Test_HitTestButton_OutsideAnyButton() {
+    PanelLayout panel{0, 0, 360, 100};
+    ButtonLayout buttons = ComputeButtonLayout(panel);
+    POINT farCorner{0, 0};
+    CHECK(HitTestButton(buttons, farCorner) == OsdButton::None);
+}
+
 int main() {
     Test_HarnessSmokeTest();
     Test_TryParseHexColor_ValidSixDigit();
@@ -128,6 +190,13 @@ int main() {
     Test_BuildSettings_ValidValuesApplied();
     Test_BuildSettings_MalformedHexFallsBackToDefault();
     Test_BuildSettings_UnknownThemeDefaultsToAuto();
+    Test_ComputePanelPosition_StandardDpi();
+    Test_ComputePanelPosition_ScaledDpi();
+    Test_ComputePanelPosition_SecondMonitorOffset();
+    Test_ComputePanelPosition_ClampsOnTinyWorkArea();
+    Test_ComputeButtonLayout_ThreeDistinctRegions();
+    Test_HitTestButton_InsideEachButton();
+    Test_HitTestButton_OutsideAnyButton();
 
     wprintf(L"\n%d/%d tests passed\n", g_testsRun - g_testsFailed, g_testsRun);
     return g_testsFailed == 0 ? 0 : 1;

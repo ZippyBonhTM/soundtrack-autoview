@@ -189,6 +189,76 @@ inline ModSettings BuildSettings(int rawDuration, const std::wstring& rawTheme,
     return settings;
 }
 
+struct PanelLayout {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+inline constexpr int kPanelBaseWidthDip = 360;
+inline constexpr int kPanelBaseHeightDip = 100;
+inline constexpr int kPanelMarginDip = 12;
+
+inline PanelLayout ComputePanelPosition(const RECT& workArea, UINT dpi) {
+    double scale = dpi / 96.0;
+    int width = static_cast<int>(kPanelBaseWidthDip * scale);
+    int height = static_cast<int>(kPanelBaseHeightDip * scale);
+    int margin = static_cast<int>(kPanelMarginDip * scale);
+
+    int x = workArea.right - width - margin;
+    int y = workArea.bottom - height - margin;
+
+    if (x < workArea.left) x = workArea.left;
+    if (y < workArea.top) y = workArea.top;
+
+    PanelLayout layout;
+    layout.x = x;
+    layout.y = y;
+    layout.width = width;
+    layout.height = height;
+    return layout;
+}
+
+struct ButtonLayout {
+    RECT previous;
+    RECT playPause;
+    RECT next;
+};
+
+inline ButtonLayout ComputeButtonLayout(const PanelLayout& panel) {
+    int buttonSize = panel.height / 3;
+    int centerY = panel.y + panel.height - buttonSize - (panel.height / 8);
+    int spacing = buttonSize + buttonSize / 2;
+    int centerX = panel.x + panel.width / 2;
+
+    ButtonLayout buttons;
+    buttons.playPause = {centerX - buttonSize / 2, centerY,
+                          centerX + buttonSize / 2, centerY + buttonSize};
+    buttons.previous = {centerX - spacing - buttonSize / 2, centerY,
+                         centerX - spacing + buttonSize / 2, centerY + buttonSize};
+    buttons.next = {centerX + spacing - buttonSize / 2, centerY,
+                     centerX + spacing + buttonSize / 2, centerY + buttonSize};
+    return buttons;
+}
+
+enum class OsdButton {
+    None,
+    Previous,
+    PlayPause,
+    Next,
+};
+
+inline OsdButton HitTestButton(const ButtonLayout& buttons, POINT pt) {
+    auto inside = [](const RECT& r, POINT p) {
+        return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+    };
+    if (inside(buttons.playPause, pt)) return OsdButton::PlayPause;
+    if (inside(buttons.previous, pt)) return OsdButton::Previous;
+    if (inside(buttons.next, pt)) return OsdButton::Next;
+    return OsdButton::None;
+}
+
 // ---------------------------------------------------------------------------
 // Windhawk mod entry points and OS-integration code. Excluded from the unit
 // test build since they depend on the Windhawk engine (Wh_* functions) and
