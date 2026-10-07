@@ -705,6 +705,55 @@ static const wchar_t kOsdWindowClassName[] = L"SoundTrackAutoViewOsdWindow";
 // class registered under explorer's handle survives a mod reload/update and
 // a later CreateWindowExW can resolve it back to the old, already-unloaded
 // DLL's window procedure, crashing explorer.
+// CreateWindowInBand is an undocumented user32.dll export that places a
+// window in a specific shell Z-order "band" instead of the ordinary
+// topmost band. Plain HWND_TOPMOST windows lose z-order contests against
+// the shell's own topmost elements (the taskbar in particular): when the
+// taskbar is set to auto-hide and hidden, a plain topmost OSD window can
+// end up visually buried and only resurfaces once the taskbar is shown
+// again. ZBID_IMMERSIVE_NOTIFICATION is the band Windows uses for system
+// notification toasts, which is exactly the visibility behavior this
+// panel wants (always on top, independent of taskbar state). This
+// approach is already used — and confirmed working on this machine — by
+// the "Taskbar Music Lounge" Windhawk mod.
+enum ZBID {
+    ZBID_DEFAULT = 0,
+    ZBID_IMMERSIVE_NOTIFICATION = 4,
+};
+
+using PCreateWindowInBand = HWND(WINAPI*)(DWORD dwExStyle, LPCWSTR lpClassName,
+                                           LPCWSTR lpWindowName, DWORD dwStyle,
+                                           int x, int y, int nWidth, int nHeight,
+                                           HWND hWndParent, HMENU hMenu,
+                                           HINSTANCE hInstance, LPVOID lpParam,
+                                           DWORD dwBand);
+
+// Falls back to a plain CreateWindowExW if CreateWindowInBand isn't
+// available (undocumented API; not guaranteed present on every Windows
+// build) or fails for any reason.
+static HWND CreateOsdWindowHandle(DWORD exStyle, LPCWSTR className,
+                                   LPCWSTR windowName, DWORD style,
+                                   HINSTANCE hInstance) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        auto createWindowInBand = reinterpret_cast<PCreateWindowInBand>(
+            GetProcAddress(user32, "CreateWindowInBand"));
+        if (createWindowInBand) {
+            HWND hwnd = createWindowInBand(
+                exStyle, className, windowName, style, 0, 0, 1, 1, nullptr,
+                nullptr, hInstance, nullptr, ZBID_IMMERSIVE_NOTIFICATION);
+            if (hwnd) {
+                return hwnd;
+            }
+            Wh_Log(L"SoundTrackAutoView: CreateWindowInBand failed, error %lu",
+                   GetLastError());
+        }
+    }
+
+    return CreateWindowExW(exStyle, className, windowName, style, 0, 0, 1, 1,
+                            nullptr, nullptr, hInstance, nullptr);
+}
+
 static HMODULE GetOwnModuleHandle() {
     HMODULE hModule = nullptr;
     GetModuleHandleExW(
@@ -1103,10 +1152,9 @@ HWND CreateOsdWindow(HINSTANCE /*hInstance*/) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
 
-    HWND hwnd = CreateWindowExW(
+    HWND hwnd = CreateOsdWindowHandle(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        kOsdWindowClassName, L"SoundTrackAutoView", WS_POPUP, 0, 0, 1, 1, nullptr,
-        nullptr, ownModule, nullptr);
+        kOsdWindowClassName, L"SoundTrackAutoView", WS_POPUP, ownModule);
 
     if (hwnd) {
         DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
