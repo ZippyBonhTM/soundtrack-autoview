@@ -234,6 +234,24 @@ static void Test_OsdTimingController_RetriggerAfterHideReplaysFadeIn() {
     CHECK(result.shouldPlayFadeIn);
 }
 
+static void Test_OsdTimingController_SetDurationSecondsDoesNotResetVisibility() {
+    OsdTimingController controller(4.0);
+    controller.OnTrigger(0.0);
+    controller.SetDurationSeconds(10.0);
+    CHECK(controller.IsVisible());
+    auto result = controller.OnTrigger(0.5);
+    CHECK(!result.shouldPlayFadeIn);  // still visible, no fade-in replay
+}
+
+static void Test_OsdTimingController_SetDurationSecondsAffectsNextDeadline() {
+    OsdTimingController controller(4.0);
+    controller.OnTrigger(0.0);
+    controller.SetDurationSeconds(10.0);
+    controller.OnTrigger(0.0);  // re-trigger, now under the new duration
+    CHECK(!controller.ShouldHideNow(9.9));
+    CHECK(controller.ShouldHideNow(10.0));
+}
+
 static void Test_ShouldShowPanel_TrueWhenSnapshotPresent() {
     TrackSnapshot snapshot;
     snapshot.title = L"Falling Down - Bonus Track";
@@ -275,6 +293,8 @@ int main() {
     Test_OsdTimingController_HoverPausesCountdown();
     Test_OsdTimingController_MouseLeaveResumesFromFullDuration();
     Test_OsdTimingController_RetriggerAfterHideReplaysFadeIn();
+    Test_OsdTimingController_SetDurationSecondsDoesNotResetVisibility();
+    Test_OsdTimingController_SetDurationSecondsAffectsNextDeadline();
     Test_ShouldShowPanel_TrueWhenSnapshotPresent();
     Test_ShouldShowPanel_FalseWhenNoSession();
 

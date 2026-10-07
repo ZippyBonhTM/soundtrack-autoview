@@ -5,7 +5,7 @@
 // @version         1.0
 // @author          zippy
 // @include         explorer.exe
-// @compilerOptions -ld2d1 -ldwrite -ldwmapi -lwindowscodecs -lole32 -lruntimeobject -lshcore
+// @compilerOptions -ld2d1 -ldwrite -ldwmapi -lwindowscodecs -lole32 -lruntimeobject -lshcore -lgdi32 -loleaut32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -283,6 +283,10 @@ public:
         return result;
     }
 
+    void SetDurationSeconds(double durationSeconds) {
+        durationSeconds_ = durationSeconds;
+    }
+
     bool OnSmtcUpdate(double nowSeconds) const {
         return visible_ && nowSeconds <= correctionDeadlineSeconds_;
     }
@@ -432,6 +436,36 @@ void UninstallKeyboardHook() {
     }
 }
 
+// A WH_KEYBOARD_LL hook's callback runs on the thread that installed it, and
+// that thread must pump messages or Windows will eventually consider the
+// hook unresponsive and silently remove it (or input across the system can
+// lag while the hook is being serviced). Wh_ModInit's own calling thread
+// isn't documented to pump messages, so the hook gets its own dedicated
+// thread whose only job is installing the hook and running a message loop.
+static HANDLE g_hookThreadHandle = nullptr;
+static std::atomic<DWORD> g_hookThreadId{0};
+
+static DWORD WINAPI HookThreadProc(LPVOID) {
+    if (!InstallKeyboardHook()) {
+        return 1;
+    }
+
+    MSG msg;
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);  // ensure a message queue exists
+    g_hookThreadId.store(GetCurrentThreadId());
+
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    UninstallKeyboardHook();
+    return 0;
+}
+
+#include <algorithm>
+#include <chrono>
+
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.Control.h>
@@ -439,10 +473,25 @@ void UninstallKeyboardHook() {
 #include <wincodec.h>
 #include <shcore.h>
 
+using winrt::Windows::Foundation::AsyncStatus;
 using winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession;
 using winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
 using winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus;
 using winrt::Windows::Storage::Streams::IRandomAccessStreamReference;
+
+// Waits for a WinRT async operation up to timeoutMs. Spec requires blocking
+// SMTC/thumbnail reads to have a short timeout rather than hang the OSD
+// thread (and, transitively, every subsequent trigger) on a slow or hung
+// app. Returns false (and cancels the operation) on timeout or failure.
+template <typename TAsync>
+static bool WaitWithTimeout(TAsync const& async, int timeoutMs) {
+    if (async.wait_for(std::chrono::milliseconds(timeoutMs)) ==
+        AsyncStatus::Completed) {
+        return true;
+    }
+    async.Cancel();
+    return false;
+}
 
 static GlobalSystemMediaTransportControlsSessionManager g_sessionManager{nullptr};
 
@@ -451,8 +500,12 @@ static bool EnsureSessionManager() {
         return true;
     }
     try {
-        g_sessionManager =
-            GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+        auto op = GlobalSystemMediaTransportControlsSessionManager::RequestAsync();
+        if (!WaitWithTimeout(op, 2000)) {
+            Wh_Log(L"SoundTrackAutoView: timed out getting session manager");
+            return false;
+        }
+        g_sessionManager = op.GetResults();
         return true;
     } catch (const winrt::hresult_error& ex) {
         Wh_Log(L"SoundTrackAutoView: failed to get session manager: %s",
@@ -475,11 +528,22 @@ static PlaybackState ToPlaybackState(
     }
 }
 
+// Album art thumbnails come from whatever app currently owns the SMTC
+// session, so their size can't be trusted: cap both the source image's
+// dimensions and the final decoded size to keep a hostile or buggy app
+// from forcing a multi-gigabyte allocation.
+inline constexpr UINT kMaxThumbnailSourceDimension = 8192;
+inline constexpr UINT kThumbnailTargetDimension = 256;
+
 static bool TryDecodeThumbnail(IRandomAccessStreamReference const& thumbnailRef,
                                 std::vector<uint8_t>& outPixelsBgra, int& outWidth,
                                 int& outHeight) {
     try {
-        auto stream = thumbnailRef.OpenReadAsync().get();
+        auto openOp = thumbnailRef.OpenReadAsync();
+        if (!WaitWithTimeout(openOp, 500)) {
+            return false;
+        }
+        auto stream = openOp.GetResults();
 
         winrt::com_ptr<IStream> comStream;
         winrt::check_hresult(CreateStreamOverRandomAccessStream(
@@ -498,11 +562,44 @@ static bool TryDecodeThumbnail(IRandomAccessStreamReference const& thumbnailRef,
         winrt::com_ptr<IWICBitmapFrameDecode> frame;
         winrt::check_hresult(decoder->GetFrame(0, frame.put()));
 
+        UINT sourceWidth = 0, sourceHeight = 0;
+        winrt::check_hresult(frame->GetSize(&sourceWidth, &sourceHeight));
+        if (sourceWidth == 0 || sourceHeight == 0 ||
+            sourceWidth > kMaxThumbnailSourceDimension ||
+            sourceHeight > kMaxThumbnailSourceDimension) {
+            return false;
+        }
+
+        // Downscale to a fixed target size: the panel only ever draws this
+        // art at a small fixed size, so decoding (and re-uploading to D2D
+        // on every fade frame) at the source app's full resolution is pure
+        // waste. Preserve aspect ratio, longest side = target dimension.
+        double scale = static_cast<double>(kThumbnailTargetDimension) /
+                       std::max(sourceWidth, sourceHeight);
+        UINT targetWidth =
+            std::max(1u, static_cast<UINT>(sourceWidth * scale + 0.5));
+        UINT targetHeight =
+            std::max(1u, static_cast<UINT>(sourceHeight * scale + 0.5));
+
+        winrt::com_ptr<IWICBitmapSource> sourceForConversion = frame;
+        if (targetWidth < sourceWidth || targetHeight < sourceHeight) {
+            winrt::com_ptr<IWICBitmapScaler> scaler;
+            winrt::check_hresult(wicFactory->CreateBitmapScaler(scaler.put()));
+            winrt::check_hresult(scaler->Initialize(
+                frame.get(), targetWidth, targetHeight,
+                WICBitmapInterpolationModeFant));
+            sourceForConversion = scaler;
+        }
+
         winrt::com_ptr<IWICFormatConverter> converter;
         winrt::check_hresult(wicFactory->CreateFormatConverter(converter.put()));
+        // Premultiplied to match the D2D1_ALPHA_MODE_PREMULTIPLIED bitmap
+        // this gets uploaded into later (PaintOsdContent) — decoding
+        // straight alpha here would make any translucent art render with
+        // wrong (too-bright) colors once D2D treats it as premultiplied.
         winrt::check_hresult(converter->Initialize(
-            frame.get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone,
-            nullptr, 0.0, WICBitmapPaletteTypeCustom));
+            sourceForConversion.get(), GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom));
 
         UINT width = 0, height = 0;
         winrt::check_hresult(converter->GetSize(&width, &height));
@@ -515,7 +612,7 @@ static bool TryDecodeThumbnail(IRandomAccessStreamReference const& thumbnailRef,
         outWidth = static_cast<int>(width);
         outHeight = static_cast<int>(height);
         return true;
-    } catch (const winrt::hresult_error&) {
+    } catch (...) {
         return false;
     }
 }
@@ -525,18 +622,23 @@ std::optional<TrackSnapshot> TryGetCurrentTrackSnapshot() {
         return std::nullopt;
     }
 
-    auto session = g_sessionManager.GetCurrentSession();
-    if (!session) {
-        return std::nullopt;
-    }
-
     try {
+        auto session = g_sessionManager.GetCurrentSession();
+        if (!session) {
+            return std::nullopt;
+        }
+
         TrackSnapshot snapshot;
 
         auto playbackInfo = session.GetPlaybackInfo();
         snapshot.status = ToPlaybackState(playbackInfo.PlaybackStatus());
 
-        auto properties = session.TryGetMediaPropertiesAsync().get();
+        auto propertiesOp = session.TryGetMediaPropertiesAsync();
+        if (!WaitWithTimeout(propertiesOp, 500)) {
+            Wh_Log(L"SoundTrackAutoView: timed out reading media properties");
+            return std::nullopt;
+        }
+        auto properties = propertiesOp.GetResults();
         snapshot.title = properties.Title().c_str();
         snapshot.artist = properties.Artist().c_str();
 
@@ -555,23 +657,38 @@ std::optional<TrackSnapshot> TryGetCurrentTrackSnapshot() {
 }
 
 void SendPlayPauseCommand() {
-    if (!EnsureSessionManager()) return;
-    if (auto session = g_sessionManager.GetCurrentSession()) {
-        session.TryTogglePlayPauseAsync();
+    try {
+        if (!EnsureSessionManager()) return;
+        if (auto session = g_sessionManager.GetCurrentSession()) {
+            session.TryTogglePlayPauseAsync();
+        }
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"SoundTrackAutoView: play/pause command failed: %s",
+               ex.message().c_str());
     }
 }
 
 void SendNextTrackCommand() {
-    if (!EnsureSessionManager()) return;
-    if (auto session = g_sessionManager.GetCurrentSession()) {
-        session.TrySkipNextAsync();
+    try {
+        if (!EnsureSessionManager()) return;
+        if (auto session = g_sessionManager.GetCurrentSession()) {
+            session.TrySkipNextAsync();
+        }
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"SoundTrackAutoView: next-track command failed: %s",
+               ex.message().c_str());
     }
 }
 
 void SendPreviousTrackCommand() {
-    if (!EnsureSessionManager()) return;
-    if (auto session = g_sessionManager.GetCurrentSession()) {
-        session.TrySkipPreviousAsync();
+    try {
+        if (!EnsureSessionManager()) return;
+        if (auto session = g_sessionManager.GetCurrentSession()) {
+            session.TrySkipPreviousAsync();
+        }
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"SoundTrackAutoView: previous-track command failed: %s",
+               ex.message().c_str());
     }
 }
 
@@ -582,6 +699,21 @@ void SendPreviousTrackCommand() {
 
 static const wchar_t kOsdWindowClassName[] = L"SoundTrackAutoViewOsdWindow";
 
+// Returns this mod DLL's own HMODULE. GetModuleHandleW(nullptr) would
+// return explorer.exe's handle instead, which is wrong for RegisterClassExW
+// here: every Windhawk compile produces a differently-named mod DLL, so a
+// class registered under explorer's handle survives a mod reload/update and
+// a later CreateWindowExW can resolve it back to the old, already-unloaded
+// DLL's window procedure, crashing explorer.
+static HMODULE GetOwnModuleHandle() {
+    HMODULE hModule = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&GetOwnModuleHandle), &hModule);
+    return hModule;
+}
+
 static winrt::com_ptr<ID2D1Factory> g_d2dFactory;
 static winrt::com_ptr<IDWriteFactory> g_dwriteFactory;
 static HWND g_osdWindow = nullptr;
@@ -589,6 +721,17 @@ static PanelLayout g_currentLayout;
 static ThemePalette g_currentPalette;
 static TrackSnapshot g_currentSnapshot;
 static float g_currentAlpha = 1.0f;
+static UINT g_currentDpi = 96;
+static OsdButton g_hoveredButton = OsdButton::None;
+
+// WM_LBUTTONUP/WM_MOUSEMOVE deliver client-area coordinates in physical
+// pixels; drawing (and therefore HitTestButton) operates in the fixed DIP
+// panel space (see PaintOsdContent's SetDpi comment). Converts one into
+// the other so a click always lands on the button actually drawn there.
+static POINT PhysicalPointToDip(POINT pt, UINT dpi) {
+    return POINT{MulDiv(pt.x, 96, static_cast<int>(dpi)),
+                 MulDiv(pt.y, 96, static_cast<int>(dpi))};
+}
 
 static void EnsureGraphicsFactories() {
     if (!g_d2dFactory) {
@@ -620,6 +763,22 @@ static bool IsSystemInDarkMode() {
     return value == 0;  // AppsUseLightTheme == 0 means dark mode
 }
 
+// Returns the current Windows accent color, or false if DWM can't report
+// one (e.g. composition disabled), leaving outColor untouched.
+static bool TryGetSystemAccentColor(RgbaColor& outColor) {
+    DWORD colorization = 0;
+    BOOL opaqueBlend = FALSE;
+    if (FAILED(DwmGetColorizationColor(&colorization, &opaqueBlend))) {
+        return false;
+    }
+    // DwmGetColorizationColor returns 0xAARRGGBB.
+    outColor.a = 1.0f;
+    outColor.r = ((colorization >> 16) & 0xFF) / 255.0f;
+    outColor.g = ((colorization >> 8) & 0xFF) / 255.0f;
+    outColor.b = (colorization & 0xFF) / 255.0f;
+    return true;
+}
+
 static void DrawMusicNotePlaceholder(ID2D1DCRenderTarget* dcTarget,
                                       const D2D1_RECT_F& rect,
                                       ID2D1SolidColorBrush* brush) {
@@ -649,7 +808,8 @@ static void DrawMusicNotePlaceholder(ID2D1DCRenderTarget* dcTarget,
 
 static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
                              const ThemePalette& palette,
-                             const TrackSnapshot& snapshot, float alpha) {
+                             const TrackSnapshot& snapshot, float alpha,
+                             UINT dpi, OsdButton hoveredButton) {
     EnsureGraphicsFactories();
 
     BITMAPINFO bmi{};
@@ -675,6 +835,19 @@ static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
 
     RECT bindRect{0, 0, layout.width, layout.height};
     dcTarget->BindDC(memDc, &bindRect);
+
+    // The bitmap is sized in physical pixels (layout.width/height already
+    // scaled by dpi/96), but every drawing coordinate below is authored in
+    // DIPs against the fixed base panel size (kPanelBaseWidthDip x
+    // kPanelBaseHeightDip). Telling the render target the real monitor DPI
+    // here is what makes D2D scale those DIP coordinates up to fill the
+    // larger physical bitmap — without it, a DC render target defaults to
+    // 96 DPI and everything draws at its 100%-scale size in the corner of
+    // a bitmap that's actually bigger, while ComputeButtonLayout (driven
+    // by the scaled PanelLayout the hit-test code also uses) would still
+    // compute button positions against the full scaled size, so drawn and
+    // clickable regions would disagree.
+    dcTarget->SetDpi(static_cast<float>(dpi), static_cast<float>(dpi));
 
     dcTarget->BeginDraw();
     dcTarget->Clear(D2D1::ColorF(palette.background.r, palette.background.g,
@@ -709,7 +882,7 @@ static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us",
         artistFormat.put());
 
-    float artSize = static_cast<float>(layout.height) - 24.0f;
+    float artSize = static_cast<float>(kPanelBaseHeightDip) - 24.0f;
     D2D1_RECT_F artRect = D2D1::RectF(12.0f, 12.0f, 12.0f + artSize, 12.0f + artSize);
 
     if (!snapshot.artPixelsBgra.empty()) {
@@ -736,10 +909,10 @@ static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
     }
 
     float textLeft = artRect.right + 12.0f;
-    D2D1_RECT_F titleRect =
-        D2D1::RectF(textLeft, 14.0f, static_cast<float>(layout.width) - 12.0f, 34.0f);
-    D2D1_RECT_F artistRect =
-        D2D1::RectF(textLeft, 36.0f, static_cast<float>(layout.width) - 12.0f, 54.0f);
+    D2D1_RECT_F titleRect = D2D1::RectF(
+        textLeft, 14.0f, static_cast<float>(kPanelBaseWidthDip) - 12.0f, 34.0f);
+    D2D1_RECT_F artistRect = D2D1::RectF(
+        textLeft, 36.0f, static_cast<float>(kPanelBaseWidthDip) - 12.0f, 54.0f);
 
     dcTarget->DrawText(snapshot.title.c_str(),
                         static_cast<UINT32>(snapshot.title.size()), titleFormat.get(),
@@ -748,14 +921,21 @@ static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
                         static_cast<UINT32>(snapshot.artist.size()),
                         artistFormat.get(), artistRect, textSecondaryBrush.get());
 
-    PanelLayout panelForButtons{0, 0, layout.width, layout.height};
+    PanelLayout panelForButtons{0, 0, kPanelBaseWidthDip, kPanelBaseHeightDip};
     ButtonLayout buttons = ComputeButtonLayout(panelForButtons);
 
-    auto drawButton = [&](const RECT& r, const wchar_t* glyph) {
+    winrt::com_ptr<ID2D1SolidColorBrush> accentHoverBrush;
+    dcTarget->CreateSolidColorBrush(
+        D2D1::ColorF(palette.accent.r, palette.accent.g, palette.accent.b,
+                     std::min(1.0f, palette.accent.a + 0.2f)),
+        accentHoverBrush.put());
+
+    auto drawButton = [&](const RECT& r, const wchar_t* glyph, OsdButton id) {
         D2D1_ELLIPSE circle = D2D1::Ellipse(
             D2D1::Point2F((r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f),
             (r.right - r.left) / 2.0f, (r.bottom - r.top) / 2.0f);
-        dcTarget->FillEllipse(circle, accentBrush.get());
+        dcTarget->FillEllipse(
+            circle, (id == hoveredButton) ? accentHoverBrush.get() : accentBrush.get());
 
         D2D1_RECT_F glyphRect =
             D2D1::RectF(static_cast<float>(r.left), static_cast<float>(r.top),
@@ -770,10 +950,11 @@ static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
         dcTarget->DrawText(glyph, 1, glyphFormat.get(), glyphRect, textBrush.get());
     };
 
-    drawButton(buttons.previous, L"");
+    drawButton(buttons.previous, L"", OsdButton::Previous);
     drawButton(buttons.playPause,
-               snapshot.status == PlaybackState::Playing ? L"" : L"");
-    drawButton(buttons.next, L"");
+               snapshot.status == PlaybackState::Playing ? L"" : L"",
+               OsdButton::PlayPause);
+    drawButton(buttons.next, L"", OsdButton::Next);
 
     dcTarget->EndDraw();
 
@@ -827,7 +1008,7 @@ static void StepFadeAnimation(HWND hwnd) {
         }
     }
     PaintOsdContent(hwnd, g_currentLayout, g_currentPalette, g_currentSnapshot,
-                    g_currentAlpha);
+                    g_currentAlpha, g_currentDpi, g_hoveredButton);
 }
 
 static void StartHideAnimation(HWND hwnd) {
@@ -858,17 +1039,37 @@ static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
             TrackMouseEvent(&tme);
             g_timingController.OnMouseEnter(NowInSeconds());
+
+            PanelLayout panelForButtons{0, 0, kPanelBaseWidthDip,
+                                         kPanelBaseHeightDip};
+            ButtonLayout buttons = ComputeButtonLayout(panelForButtons);
+            POINT physicalPt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            POINT dipPt = PhysicalPointToDip(physicalPt, g_currentDpi);
+            OsdButton hit = HitTestButton(buttons, dipPt);
+            if (hit != g_hoveredButton) {
+                g_hoveredButton = hit;
+                PaintOsdContent(hwnd, g_currentLayout, g_currentPalette,
+                                g_currentSnapshot, g_currentAlpha, g_currentDpi,
+                                g_hoveredButton);
+            }
             return 0;
         }
         case WM_MOUSELEAVE: {
             g_timingController.OnMouseLeave(NowInSeconds());
+            if (g_hoveredButton != OsdButton::None) {
+                g_hoveredButton = OsdButton::None;
+                PaintOsdContent(hwnd, g_currentLayout, g_currentPalette,
+                                g_currentSnapshot, g_currentAlpha, g_currentDpi,
+                                g_hoveredButton);
+            }
             return 0;
         }
         case WM_LBUTTONUP: {
-            PanelLayout panelForButtons{0, 0, g_currentLayout.width,
-                                         g_currentLayout.height};
+            PanelLayout panelForButtons{0, 0, kPanelBaseWidthDip,
+                                         kPanelBaseHeightDip};
             ButtonLayout buttons = ComputeButtonLayout(panelForButtons);
-            POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            POINT physicalPt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            POINT pt = PhysicalPointToDip(physicalPt, g_currentDpi);
             switch (HitTestButton(buttons, pt)) {
                 case OsdButton::Previous:
                     SendPreviousTrackCommand();
@@ -891,11 +1092,13 @@ static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     }
 }
 
-HWND CreateOsdWindow(HINSTANCE hInstance) {
+HWND CreateOsdWindow(HINSTANCE /*hInstance*/) {
+    HINSTANCE ownModule = reinterpret_cast<HINSTANCE>(GetOwnModuleHandle());
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = OsdWndProc;
-    wc.hInstance = hInstance;
+    wc.hInstance = ownModule;
     wc.lpszClassName = kOsdWindowClassName;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
@@ -903,7 +1106,7 @@ HWND CreateOsdWindow(HINSTANCE hInstance) {
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         kOsdWindowClassName, L"SoundTrackAutoView", WS_POPUP, 0, 0, 1, 1, nullptr,
-        nullptr, hInstance, nullptr);
+        nullptr, ownModule, nullptr);
 
     if (hwnd) {
         DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
@@ -928,6 +1131,7 @@ void UpdateOsdContent(HWND hwnd, const TrackSnapshot& snapshot) {
 
     UINT dpi = GetDpiForWindow(hwnd);
     if (dpi == 0) dpi = 96;
+    g_currentDpi = dpi;
 
     g_currentLayout = ComputePanelPosition(monitorInfo.rcWork, dpi);
 
@@ -937,11 +1141,20 @@ void UpdateOsdContent(HWND hwnd, const TrackSnapshot& snapshot) {
                                 settings->customText, settings->customAccent};
     g_currentPalette = ResolvePalette(settings->theme, systemIsDark, customPalette);
 
+    // The native flyout's "auto" look follows the system accent color, not
+    // just light/dark; light/dark/custom keep their own defined accent.
+    if (settings->theme == ThemeMode::Auto) {
+        RgbaColor systemAccent;
+        if (TryGetSystemAccentColor(systemAccent)) {
+            g_currentPalette.accent = systemAccent;
+        }
+    }
+
     SetWindowPos(hwnd, HWND_TOPMOST, g_currentLayout.x, g_currentLayout.y,
                  g_currentLayout.width, g_currentLayout.height, SWP_NOACTIVATE);
 
     PaintOsdContent(hwnd, g_currentLayout, g_currentPalette, g_currentSnapshot,
-                    g_currentAlpha);
+                    g_currentAlpha, g_currentDpi, g_hoveredButton);
 }
 
 void TriggerOsdDisplay(const TrackSnapshot& snapshot) {
@@ -957,9 +1170,16 @@ void TriggerOsdDisplay(const TrackSnapshot& snapshot) {
         g_fadingOut = false;
         SetTimer(g_osdWindow, kFadeTimerId, kFadeTimerIntervalMs, nullptr);
     } else {
+        // Already visible: cancel any in-progress fade-out from a previous
+        // auto-hide timeout so the panel snaps back to fully visible
+        // instead of continuing to fade away under a fresh trigger.
+        KillTimer(g_osdWindow, kFadeTimerId);
+        g_fadingIn = false;
+        g_fadingOut = false;
         g_currentAlpha = 1.0f;
         PaintOsdContent(g_osdWindow, g_currentLayout, g_currentPalette,
-                        g_currentSnapshot, g_currentAlpha);
+                        g_currentSnapshot, g_currentAlpha, g_currentDpi,
+                        g_hoveredButton);
     }
 
     SetTimer(g_osdWindow, kAutoHideTimerId, 100, nullptr);
@@ -972,34 +1192,50 @@ void ApplySmtcCorrection(const TrackSnapshot& snapshot) {
     }
     UpdateOsdContent(g_osdWindow, snapshot);
     PaintOsdContent(g_osdWindow, g_currentLayout, g_currentPalette,
-                    g_currentSnapshot, g_currentAlpha);
+                    g_currentSnapshot, g_currentAlpha, g_currentDpi,
+                    g_hoveredButton);
 }
 
 static constexpr UINT kOsdCorrectionMessage = WM_APP + 2;
 
 static HANDLE g_osdThreadHandle = nullptr;
-static winrt::event_token g_playbackInfoToken;
-static winrt::event_token g_propertiesToken;
+static GlobalSystemMediaTransportControlsSession::PlaybackInfoChanged_revoker
+    g_playbackInfoRevoker;
+static GlobalSystemMediaTransportControlsSession::MediaPropertiesChanged_revoker
+    g_propertiesRevoker;
 static GlobalSystemMediaTransportControlsSession g_subscribedSession{nullptr};
 
+// Assigning to an event_revoker revokes whatever registration it previously
+// held before taking the new one, so switching the "current" SMTC session
+// (e.g. Spotify -> a browser tab) can never leave a handler registered
+// against a session this mod no longer tracks. Wh_ModUninit resets both
+// revokers to default-constructed (empty, already-revoked) ones, which is
+// also safe to do unconditionally even if no session was ever subscribed.
 static void EnsureSmtcSubscription() {
-    if (!EnsureSessionManager()) return;
-    auto session = g_sessionManager.GetCurrentSession();
-    if (!session || session == g_subscribedSession) return;
+    try {
+        if (!EnsureSessionManager()) return;
+        auto session = g_sessionManager.GetCurrentSession();
+        if (!session || session == g_subscribedSession) return;
 
-    g_subscribedSession = session;
-    g_playbackInfoToken = session.PlaybackInfoChanged([](auto&&, auto&&) {
-        DWORD threadId = g_osdThreadId.load();
-        if (threadId != 0) {
-            PostThreadMessageW(threadId, kOsdCorrectionMessage, 0, 0);
-        }
-    });
-    g_propertiesToken = session.MediaPropertiesChanged([](auto&&, auto&&) {
-        DWORD threadId = g_osdThreadId.load();
-        if (threadId != 0) {
-            PostThreadMessageW(threadId, kOsdCorrectionMessage, 0, 0);
-        }
-    });
+        g_subscribedSession = session;
+        g_playbackInfoRevoker = session.PlaybackInfoChanged(
+            winrt::auto_revoke, [](auto&&, auto&&) {
+                DWORD threadId = g_osdThreadId.load();
+                if (threadId != 0) {
+                    PostThreadMessageW(threadId, kOsdCorrectionMessage, 0, 0);
+                }
+            });
+        g_propertiesRevoker = session.MediaPropertiesChanged(
+            winrt::auto_revoke, [](auto&&, auto&&) {
+                DWORD threadId = g_osdThreadId.load();
+                if (threadId != 0) {
+                    PostThreadMessageW(threadId, kOsdCorrectionMessage, 0, 0);
+                }
+            });
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"SoundTrackAutoView: failed to subscribe to session events: %s",
+               ex.message().c_str());
+    }
 }
 
 static DWORD WINAPI OsdThreadProc(LPVOID) {
@@ -1014,7 +1250,7 @@ static DWORD WINAPI OsdThreadProc(LPVOID) {
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == kOsdTriggerMessage) {
             auto settings = GetCurrentSettings();
-            g_timingController = OsdTimingController(settings->durationSeconds);
+            g_timingController.SetDurationSeconds(settings->durationSeconds);
 
             auto snapshot = TryGetCurrentTrackSnapshot();
             if (ShouldShowPanel(snapshot)) {
@@ -1022,9 +1258,14 @@ static DWORD WINAPI OsdThreadProc(LPVOID) {
                 TriggerOsdDisplay(*snapshot);
             }
         } else if (msg.message == kOsdCorrectionMessage) {
-            auto snapshot = TryGetCurrentTrackSnapshot();
-            if (ShouldShowPanel(snapshot)) {
-                ApplySmtcCorrection(*snapshot);
+            // Cheap check first: most SMTC events land outside the ~1s
+            // correction window and should never pay for a session read
+            // plus thumbnail decode just to be discarded.
+            if (g_timingController.OnSmtcUpdate(NowInSeconds())) {
+                auto snapshot = TryGetCurrentTrackSnapshot();
+                if (ShouldShowPanel(snapshot)) {
+                    ApplySmtcCorrection(*snapshot);
+                }
             }
         } else {
             TranslateMessage(&msg);
@@ -1036,16 +1277,55 @@ static DWORD WINAPI OsdThreadProc(LPVOID) {
         DestroyWindow(g_osdWindow);
         g_osdWindow = nullptr;
     }
+    UnregisterClassW(kOsdWindowClassName,
+                      reinterpret_cast<HINSTANCE>(GetOwnModuleHandle()));
+
+    // Release every WinRT object on the same thread (and MTA apartment)
+    // that created it, before tearing the apartment down. Doing this from
+    // Wh_ModUninit's caller thread instead would release cross-apartment
+    // COM proxies from the wrong thread, which is unsafe.
+    g_playbackInfoRevoker = {};
+    g_propertiesRevoker = {};
+    g_subscribedSession = nullptr;
+    g_sessionManager = nullptr;
+    g_d2dFactory = nullptr;
+    g_dwriteFactory = nullptr;
+
     winrt::uninit_apartment();
     return 0;
+}
+
+// @include explorer.exe also matches non-shell explorer.exe instances: a
+// spawned folder/file-dialog process, COM "-Embedding"/"-ServerName:" host
+// processes, and (on this dev machine specifically) other Windhawk mods'
+// "-tool-mod" helper instances. Only the real shell process owns the
+// taskbar's Shell_TrayWnd window, so that's used to tell it apart from the
+// rest; installing the hook and showing panels from every matching instance
+// would mean duplicate, stacked panels.
+static bool IsMainShellExplorerProcess() {
+    HWND trayWnd = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!trayWnd) {
+        return false;
+    }
+    DWORD trayProcessId = 0;
+    GetWindowThreadProcessId(trayWnd, &trayProcessId);
+    return trayProcessId == GetCurrentProcessId();
 }
 
 BOOL Wh_ModInit() {
     Wh_Log(L"SoundTrackAutoView: init");
 
+    if (!IsMainShellExplorerProcess()) {
+        Wh_Log(L"SoundTrackAutoView: not the main shell process, skipping");
+        return TRUE;
+    }
+
     RefreshSettingsFromWindhawk();
 
-    if (!InstallKeyboardHook()) {
+    g_hookThreadHandle = CreateThread(nullptr, 0, HookThreadProc, nullptr, 0, nullptr);
+    if (!g_hookThreadHandle) {
+        Wh_Log(L"SoundTrackAutoView: failed to create hook thread, error %lu",
+               GetLastError());
         return FALSE;
     }
 
@@ -1053,7 +1333,13 @@ BOOL Wh_ModInit() {
     if (!g_osdThreadHandle) {
         Wh_Log(L"SoundTrackAutoView: failed to create OSD thread, error %lu",
                GetLastError());
-        UninstallKeyboardHook();
+        DWORD hookThreadId = g_hookThreadId.load();
+        if (hookThreadId != 0) {
+            PostThreadMessageW(hookThreadId, WM_QUIT, 0, 0);
+        }
+        WaitForSingleObject(g_hookThreadHandle, INFINITE);
+        CloseHandle(g_hookThreadHandle);
+        g_hookThreadHandle = nullptr;
         return FALSE;
     }
 
@@ -1071,24 +1357,32 @@ BOOL Wh_ModInit() {
 void Wh_ModUninit() {
     Wh_Log(L"SoundTrackAutoView: uninit");
 
-    UninstallKeyboardHook();
+    // Signal both threads to quit, then wait for them to fully exit before
+    // returning. Windhawk unloads this DLL right after Wh_ModUninit
+    // returns, so giving up early (e.g. on a timeout) would let either
+    // thread keep running code that lives in a DLL that's no longer
+    // mapped — a guaranteed crash. Each thread uninstalls its own hook /
+    // destroys its own window and releases its own WinRT objects before
+    // its loop exits (see HookThreadProc / OsdThreadProc).
+    DWORD hookThreadId = g_hookThreadId.load();
+    if (hookThreadId != 0) {
+        PostThreadMessageW(hookThreadId, WM_QUIT, 0, 0);
+    }
+    if (g_hookThreadHandle) {
+        WaitForSingleObject(g_hookThreadHandle, INFINITE);
+        CloseHandle(g_hookThreadHandle);
+        g_hookThreadHandle = nullptr;
+    }
 
-    DWORD threadId = g_osdThreadId.load();
-    if (threadId != 0) {
-        PostThreadMessageW(threadId, WM_QUIT, 0, 0);
+    DWORD osdThreadId = g_osdThreadId.load();
+    if (osdThreadId != 0) {
+        PostThreadMessageW(osdThreadId, WM_QUIT, 0, 0);
     }
     if (g_osdThreadHandle) {
-        WaitForSingleObject(g_osdThreadHandle, 2000);
+        WaitForSingleObject(g_osdThreadHandle, INFINITE);
         CloseHandle(g_osdThreadHandle);
         g_osdThreadHandle = nullptr;
     }
-
-    if (g_subscribedSession) {
-        g_subscribedSession.PlaybackInfoChanged(g_playbackInfoToken);
-        g_subscribedSession.MediaPropertiesChanged(g_propertiesToken);
-        g_subscribedSession = nullptr;
-    }
-    g_sessionManager = nullptr;
 }
 
 void Wh_ModSettingsChanged() {
