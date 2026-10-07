@@ -11,6 +11,7 @@ mkdir -p "$OUT_DIR"
 
 "$COMPILER" -std=c++23 -target x86_64-w64-mingw32 \
   -DUNICODE -D_UNICODE \
+  -static \
   -I "$INCLUDE_DIR" \
   "$SRC" -o "$OUT_DIR/unit_tests.exe"
 

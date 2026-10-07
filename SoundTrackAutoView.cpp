@@ -66,7 +66,128 @@ key" — this is also what Windows' own native flyout relies on).
 // must not call any Wh_* API or touch real OS state directly.
 // ---------------------------------------------------------------------------
 
-// (pure-logic helpers added in later tasks go here)
+struct RgbaColor {
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+    float a = 1.0f;
+};
+
+enum class ThemeMode {
+    Auto,
+    Light,
+    Dark,
+    Custom,
+};
+
+inline bool TryParseHexColor(const std::wstring& hex, RgbaColor& outColor) {
+    if (hex.size() != 7 && hex.size() != 9) {
+        return false;
+    }
+    if (hex[0] != L'#') {
+        return false;
+    }
+
+    auto hexDigit = [](wchar_t c) -> int {
+        if (c >= L'0' && c <= L'9') return c - L'0';
+        if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+        if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+        return -1;
+    };
+
+    int values[4] = {0, 0, 0, 255};
+    size_t channelCount = (hex.size() == 9) ? 4 : 3;
+    for (size_t i = 0; i < channelCount; i++) {
+        int hi = hexDigit(hex[1 + i * 2]);
+        int lo = hexDigit(hex[1 + i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        values[i] = hi * 16 + lo;
+    }
+
+    outColor.r = values[0] / 255.0f;
+    outColor.g = values[1] / 255.0f;
+    outColor.b = values[2] / 255.0f;
+    outColor.a = values[3] / 255.0f;
+    return true;
+}
+
+inline ThemeMode ParseThemeMode(const std::wstring& value) {
+    if (value == L"light") return ThemeMode::Light;
+    if (value == L"dark") return ThemeMode::Dark;
+    if (value == L"custom") return ThemeMode::Custom;
+    return ThemeMode::Auto;
+}
+
+struct ThemePalette {
+    RgbaColor background;
+    RgbaColor text;
+    RgbaColor textSecondary;
+    RgbaColor accent;
+};
+
+inline const ThemePalette kLightPalette{
+    /*background*/ {0.96f, 0.96f, 0.96f, 0.85f},
+    /*text*/ {0.0f, 0.0f, 0.0f, 1.0f},
+    /*textSecondary*/ {0.35f, 0.35f, 0.35f, 1.0f},
+    /*accent*/ {0.0f, 0.47f, 0.83f, 1.0f},
+};
+
+inline const ThemePalette kDarkPalette{
+    /*background*/ {0.17f, 0.17f, 0.17f, 0.85f},
+    /*text*/ {1.0f, 1.0f, 1.0f, 1.0f},
+    /*textSecondary*/ {0.78f, 0.78f, 0.78f, 1.0f},
+    /*accent*/ {0.0f, 0.47f, 0.83f, 1.0f},
+};
+
+inline ThemePalette ResolvePalette(ThemeMode mode, bool systemIsDarkMode,
+                                    const ThemePalette& customPalette) {
+    switch (mode) {
+        case ThemeMode::Light:
+            return kLightPalette;
+        case ThemeMode::Dark:
+            return kDarkPalette;
+        case ThemeMode::Custom:
+            return customPalette;
+        case ThemeMode::Auto:
+        default:
+            return systemIsDarkMode ? kDarkPalette : kLightPalette;
+    }
+}
+
+struct ModSettings {
+    int durationSeconds = 4;
+    ThemeMode theme = ThemeMode::Auto;
+    RgbaColor customBackground{0.17f, 0.17f, 0.17f, 0.85f};
+    RgbaColor customText{1.0f, 1.0f, 1.0f, 1.0f};
+    RgbaColor customAccent{0.0f, 0.47f, 0.83f, 1.0f};
+};
+
+inline constexpr int kMinDurationSeconds = 1;
+inline constexpr int kMaxDurationSeconds = 30;
+
+inline int ClampDurationSeconds(int rawDuration) {
+    if (rawDuration < kMinDurationSeconds) return kMinDurationSeconds;
+    if (rawDuration > kMaxDurationSeconds) return kMaxDurationSeconds;
+    return rawDuration;
+}
+
+inline ModSettings BuildSettings(int rawDuration, const std::wstring& rawTheme,
+                                  const std::wstring& rawBgHex,
+                                  const std::wstring& rawTextHex,
+                                  const std::wstring& rawAccentHex) {
+    ModSettings settings;
+    settings.durationSeconds = ClampDurationSeconds(rawDuration);
+    settings.theme = ParseThemeMode(rawTheme);
+
+    RgbaColor parsed;
+    if (TryParseHexColor(rawBgHex, parsed)) settings.customBackground = parsed;
+    if (TryParseHexColor(rawTextHex, parsed)) settings.customText = parsed;
+    if (TryParseHexColor(rawAccentHex, parsed)) settings.customAccent = parsed;
+
+    return settings;
+}
 
 // ---------------------------------------------------------------------------
 // Windhawk mod entry points and OS-integration code. Excluded from the unit
