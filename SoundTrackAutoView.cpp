@@ -360,14 +360,69 @@ void RefreshSettingsFromWindhawk() {
     g_settings = settings;
 }
 
+#include <atomic>
+
+inline constexpr UINT kOsdTriggerMessage = WM_APP + 1;
+
+static std::atomic<DWORD> g_osdThreadId{0};
+static HHOOK g_keyboardHook = nullptr;
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam,
+                                              LPARAM lParam) {
+    if (nCode == HC_ACTION && wParam == WM_KEYDOWN) {
+        auto* info = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        switch (info->vkCode) {
+            case VK_MEDIA_PLAY_PAUSE:
+            case VK_MEDIA_NEXT_TRACK:
+            case VK_MEDIA_PREV_TRACK:
+            case VK_MEDIA_STOP: {
+                Wh_Log(L"SoundTrackAutoView: media key detected (vk=%u)",
+                       info->vkCode);
+                DWORD threadId = g_osdThreadId.load();
+                if (threadId != 0) {
+                    PostThreadMessageW(threadId, kOsdTriggerMessage, 0, 0);
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+bool InstallKeyboardHook() {
+    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                                        GetModuleHandleW(nullptr), 0);
+    if (!g_keyboardHook) {
+        Wh_Log(L"SoundTrackAutoView: failed to install keyboard hook, error %lu",
+               GetLastError());
+        return false;
+    }
+    return true;
+}
+
+void UninstallKeyboardHook() {
+    if (g_keyboardHook) {
+        UnhookWindowsHookEx(g_keyboardHook);
+        g_keyboardHook = nullptr;
+    }
+}
+
 BOOL Wh_ModInit() {
     Wh_Log(L"SoundTrackAutoView: init");
     RefreshSettingsFromWindhawk();
+
+    if (!InstallKeyboardHook()) {
+        return FALSE;
+    }
+
     return TRUE;
 }
 
 void Wh_ModUninit() {
     Wh_Log(L"SoundTrackAutoView: uninit");
+    UninstallKeyboardHook();
 }
 
 void Wh_ModSettingsChanged() {
