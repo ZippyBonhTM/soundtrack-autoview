@@ -54,6 +54,22 @@ key" — this is also what Windows' own native flyout relies on).
   $name: Custom accent color
   $description: >-
     Used only when Theme is set to Custom. Format: #RRGGBB or #RRGGBBAA.
+- backgroundOpacity: 85
+  $name: Background opacity (0-100)
+  $description: >-
+    How much of the blurred desktop shows through the panel's background
+    ("glass amount"). Applies regardless of the Theme setting above. Useful
+    for matching other taskbar/flyout styling mods' glass/acrylic intensity.
+- cornerStyle: round
+  $name: Corner style
+  $description: >-
+    Shape of the panel's corners, independent of Theme. Useful for matching
+    other taskbar/flyout styling mods (e.g. Squircle- or Borderless-style
+    themes).
+  $options:
+  - round: Round
+  - small: Small round
+  - square: Square
 */
 // ==/WindhawkModSettings==
 
@@ -159,12 +175,60 @@ inline ThemePalette ResolvePalette(ThemeMode mode, bool systemIsDarkMode,
     }
 }
 
+enum class CornerStyle {
+    Round,
+    Small,
+    Square,
+};
+
+inline CornerStyle ParseCornerStyle(const std::wstring& value) {
+    if (value == L"small") return CornerStyle::Small;
+    if (value == L"square") return CornerStyle::Square;
+    return CornerStyle::Round;
+}
+
+inline constexpr float kCornerRadiusRoundDip = 16.0f;
+inline constexpr float kCornerRadiusSmallDip = 6.0f;
+inline constexpr float kCornerRadiusSquareDip = 0.0f;
+
+inline float CornerRadiusDipForStyle(CornerStyle style) {
+    switch (style) {
+        case CornerStyle::Small:
+            return kCornerRadiusSmallDip;
+        case CornerStyle::Square:
+            return kCornerRadiusSquareDip;
+        case CornerStyle::Round:
+        default:
+            return kCornerRadiusRoundDip;
+    }
+}
+
+inline constexpr int kMinBackgroundOpacityPercent = 0;
+inline constexpr int kMaxBackgroundOpacityPercent = 100;
+
+inline int ClampBackgroundOpacityPercent(int percent) {
+    if (percent < kMinBackgroundOpacityPercent) return kMinBackgroundOpacityPercent;
+    if (percent > kMaxBackgroundOpacityPercent) return kMaxBackgroundOpacityPercent;
+    return percent;
+}
+
+// Overrides a color's alpha from a 0-100 opacity setting, leaving the other
+// channels untouched. Applied to the resolved background color regardless
+// of theme (auto/light/dark/custom all go through this), so "glass amount"
+// is one consistent knob independent of which theme is active.
+inline RgbaColor ApplyBackgroundOpacity(RgbaColor color, int opacityPercent) {
+    color.a = ClampBackgroundOpacityPercent(opacityPercent) / 100.0f;
+    return color;
+}
+
 struct ModSettings {
     int durationSeconds = 4;
     ThemeMode theme = ThemeMode::Auto;
     RgbaColor customBackground{0.17f, 0.17f, 0.17f, 0.85f};
     RgbaColor customText{1.0f, 1.0f, 1.0f, 1.0f};
     RgbaColor customAccent{0.0f, 0.47f, 0.83f, 1.0f};
+    int backgroundOpacityPercent = 85;
+    CornerStyle cornerStyle = CornerStyle::Round;
 };
 
 inline constexpr int kMinDurationSeconds = 1;
@@ -179,7 +243,9 @@ inline int ClampDurationSeconds(int rawDuration) {
 inline ModSettings BuildSettings(int rawDuration, const std::wstring& rawTheme,
                                   const std::wstring& rawBgHex,
                                   const std::wstring& rawTextHex,
-                                  const std::wstring& rawAccentHex) {
+                                  const std::wstring& rawAccentHex,
+                                  int rawBackgroundOpacity = 85,
+                                  const std::wstring& rawCornerStyle = L"round") {
     ModSettings settings;
     settings.durationSeconds = ClampDurationSeconds(rawDuration);
     settings.theme = ParseThemeMode(rawTheme);
@@ -188,6 +254,10 @@ inline ModSettings BuildSettings(int rawDuration, const std::wstring& rawTheme,
     if (TryParseHexColor(rawBgHex, parsed)) settings.customBackground = parsed;
     if (TryParseHexColor(rawTextHex, parsed)) settings.customText = parsed;
     if (TryParseHexColor(rawAccentHex, parsed)) settings.customAccent = parsed;
+
+    settings.backgroundOpacityPercent =
+        ClampBackgroundOpacityPercent(rawBackgroundOpacity);
+    settings.cornerStyle = ParseCornerStyle(rawCornerStyle);
 
     return settings;
 }
@@ -380,8 +450,15 @@ void RefreshSettingsFromWindhawk() {
     std::wstring accent(rawAccent);
     Wh_FreeStringSetting(rawAccent);
 
+    int rawBackgroundOpacity = Wh_GetIntSetting(L"backgroundOpacity");
+
+    PCWSTR rawCornerStyle = Wh_GetStringSetting(L"cornerStyle");
+    std::wstring cornerStyle(rawCornerStyle);
+    Wh_FreeStringSetting(rawCornerStyle);
+
     auto settings = std::make_shared<const ModSettings>(
-        BuildSettings(rawDuration, theme, bg, text, accent));
+        BuildSettings(rawDuration, theme, bg, text, accent,
+                      rawBackgroundOpacity, cornerStyle));
 
     std::lock_guard<std::mutex> lock(g_settingsMutex);
     g_settings = settings;
@@ -771,6 +848,7 @@ static ThemePalette g_currentPalette;
 static TrackSnapshot g_currentSnapshot;
 static float g_currentAlpha = 1.0f;
 static UINT g_currentDpi = 96;
+static float g_currentCornerRadiusDip = kCornerRadiusRoundDip;
 static OsdButton g_hoveredButton = OsdButton::None;
 
 // WM_LBUTTONUP/WM_MOUSEMOVE deliver client-area coordinates in physical
@@ -858,7 +936,8 @@ static void DrawMusicNotePlaceholder(ID2D1DCRenderTarget* dcTarget,
 static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
                              const ThemePalette& palette,
                              const TrackSnapshot& snapshot, float alpha,
-                             UINT dpi, OsdButton hoveredButton) {
+                             UINT dpi, OsdButton hoveredButton,
+                             float cornerRadiusDip) {
     EnsureGraphicsFactories();
 
     BITMAPINFO bmi{};
@@ -899,8 +978,26 @@ static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
     dcTarget->SetDpi(static_cast<float>(dpi), static_cast<float>(dpi));
 
     dcTarget->BeginDraw();
-    dcTarget->Clear(D2D1::ColorF(palette.background.r, palette.background.g,
-                                  palette.background.b, palette.background.a));
+
+    // Clear to fully transparent first, then fill only a rounded-rect
+    // (or square, per cornerRadiusDip) shape with the background color.
+    // DWMWA_WINDOW_CORNER_PREFERENCE is set on the window too, but that
+    // attribute's effect on a window composited via UpdateLayeredWindow
+    // (as this one is) isn't guaranteed — drawing the shape ourselves is
+    // what actually guarantees the configured corner style, independent
+    // of whether DWM honors the window attribute here.
+    dcTarget->Clear(D2D1::ColorF(0, 0, 0, 0.0f));
+
+    winrt::com_ptr<ID2D1SolidColorBrush> backgroundBrush;
+    dcTarget->CreateSolidColorBrush(
+        D2D1::ColorF(palette.background.r, palette.background.g,
+                     palette.background.b, palette.background.a),
+        backgroundBrush.put());
+    D2D1_ROUNDED_RECT backgroundShape = D2D1::RoundedRect(
+        D2D1::RectF(0.0f, 0.0f, static_cast<float>(kPanelBaseWidthDip),
+                    static_cast<float>(kPanelBaseHeightDip)),
+        cornerRadiusDip, cornerRadiusDip);
+    dcTarget->FillRoundedRectangle(backgroundShape, backgroundBrush.get());
 
     winrt::com_ptr<ID2D1SolidColorBrush> textBrush;
     dcTarget->CreateSolidColorBrush(
@@ -1057,7 +1154,8 @@ static void StepFadeAnimation(HWND hwnd) {
         }
     }
     PaintOsdContent(hwnd, g_currentLayout, g_currentPalette, g_currentSnapshot,
-                    g_currentAlpha, g_currentDpi, g_hoveredButton);
+                    g_currentAlpha, g_currentDpi, g_hoveredButton,
+                    g_currentCornerRadiusDip);
 }
 
 static void StartHideAnimation(HWND hwnd) {
@@ -1099,7 +1197,7 @@ static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 g_hoveredButton = hit;
                 PaintOsdContent(hwnd, g_currentLayout, g_currentPalette,
                                 g_currentSnapshot, g_currentAlpha, g_currentDpi,
-                                g_hoveredButton);
+                                g_hoveredButton, g_currentCornerRadiusDip);
             }
             return 0;
         }
@@ -1109,7 +1207,7 @@ static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                 g_hoveredButton = OsdButton::None;
                 PaintOsdContent(hwnd, g_currentLayout, g_currentPalette,
                                 g_currentSnapshot, g_currentAlpha, g_currentDpi,
-                                g_hoveredButton);
+                                g_hoveredButton, g_currentCornerRadiusDip);
             }
             return 0;
         }
@@ -1198,11 +1296,19 @@ void UpdateOsdContent(HWND hwnd, const TrackSnapshot& snapshot) {
         }
     }
 
+    // Background opacity ("glass amount") and corner style are independent
+    // of the theme choice, so they're applied as a final override here
+    // regardless of which theme branch produced the palette above.
+    g_currentPalette.background = ApplyBackgroundOpacity(
+        g_currentPalette.background, settings->backgroundOpacityPercent);
+    g_currentCornerRadiusDip = CornerRadiusDipForStyle(settings->cornerStyle);
+
     SetWindowPos(hwnd, HWND_TOPMOST, g_currentLayout.x, g_currentLayout.y,
                  g_currentLayout.width, g_currentLayout.height, SWP_NOACTIVATE);
 
     PaintOsdContent(hwnd, g_currentLayout, g_currentPalette, g_currentSnapshot,
-                    g_currentAlpha, g_currentDpi, g_hoveredButton);
+                    g_currentAlpha, g_currentDpi, g_hoveredButton,
+                    g_currentCornerRadiusDip);
 }
 
 void TriggerOsdDisplay(const TrackSnapshot& snapshot) {
@@ -1227,7 +1333,7 @@ void TriggerOsdDisplay(const TrackSnapshot& snapshot) {
         g_currentAlpha = 1.0f;
         PaintOsdContent(g_osdWindow, g_currentLayout, g_currentPalette,
                         g_currentSnapshot, g_currentAlpha, g_currentDpi,
-                        g_hoveredButton);
+                        g_hoveredButton, g_currentCornerRadiusDip);
     }
 
     SetTimer(g_osdWindow, kAutoHideTimerId, 100, nullptr);
@@ -1241,7 +1347,7 @@ void ApplySmtcCorrection(const TrackSnapshot& snapshot) {
     UpdateOsdContent(g_osdWindow, snapshot);
     PaintOsdContent(g_osdWindow, g_currentLayout, g_currentPalette,
                     g_currentSnapshot, g_currentAlpha, g_currentDpi,
-                    g_hoveredButton);
+                    g_hoveredButton, g_currentCornerRadiusDip);
 }
 
 static constexpr UINT kOsdCorrectionMessage = WM_APP + 2;

@@ -112,6 +112,49 @@ static void Test_BuildSettings_UnknownThemeDefaultsToAuto() {
     CHECK(settings.theme == ThemeMode::Auto);
 }
 
+static void Test_ParseCornerStyle_RecognizedValues() {
+    CHECK(ParseCornerStyle(L"round") == CornerStyle::Round);
+    CHECK(ParseCornerStyle(L"small") == CornerStyle::Small);
+    CHECK(ParseCornerStyle(L"square") == CornerStyle::Square);
+}
+
+static void Test_ParseCornerStyle_UnknownDefaultsToRound() {
+    CHECK(ParseCornerStyle(L"nonsense") == CornerStyle::Round);
+}
+
+static void Test_CornerRadiusDipForStyle_MapsEachStyle() {
+    CHECK(CornerRadiusDipForStyle(CornerStyle::Round) == kCornerRadiusRoundDip);
+    CHECK(CornerRadiusDipForStyle(CornerStyle::Small) == kCornerRadiusSmallDip);
+    CHECK(CornerRadiusDipForStyle(CornerStyle::Square) == 0.0f);
+}
+
+static void Test_ClampBackgroundOpacityPercent_ClampsToRange() {
+    CHECK(ClampBackgroundOpacityPercent(-10) == 0);
+    CHECK(ClampBackgroundOpacityPercent(150) == 100);
+    CHECK(ClampBackgroundOpacityPercent(50) == 50);
+}
+
+static void Test_ApplyBackgroundOpacity_SetsAlphaFromPercent() {
+    RgbaColor color{0.5f, 0.5f, 0.5f, 1.0f};
+    RgbaColor result = ApplyBackgroundOpacity(color, 50);
+    CHECK(result.a > 0.49f && result.a < 0.51f);
+    CHECK(result.r == 0.5f);
+}
+
+static void Test_BuildSettings_NewFieldsDefaultWhenNotProvided() {
+    ModSettings settings =
+        BuildSettings(4, L"auto", L"#2C2C2C", L"#FFFFFF", L"#0078D4");
+    CHECK(settings.backgroundOpacityPercent == 85);
+    CHECK(settings.cornerStyle == CornerStyle::Round);
+}
+
+static void Test_BuildSettings_NewFieldsAppliedWhenProvided() {
+    ModSettings settings = BuildSettings(4, L"auto", L"#2C2C2C", L"#FFFFFF",
+                                          L"#0078D4", 40, L"square");
+    CHECK(settings.backgroundOpacityPercent == 40);
+    CHECK(settings.cornerStyle == CornerStyle::Square);
+}
+
 static void Test_ComputePanelPosition_StandardDpi() {
     RECT workArea{0, 0, 1920, 1040};
     PanelLayout layout = ComputePanelPosition(workArea, 96);
@@ -278,6 +321,13 @@ int main() {
     Test_BuildSettings_ValidValuesApplied();
     Test_BuildSettings_MalformedHexFallsBackToDefault();
     Test_BuildSettings_UnknownThemeDefaultsToAuto();
+    Test_ParseCornerStyle_RecognizedValues();
+    Test_ParseCornerStyle_UnknownDefaultsToRound();
+    Test_CornerRadiusDipForStyle_MapsEachStyle();
+    Test_ClampBackgroundOpacityPercent_ClampsToRange();
+    Test_ApplyBackgroundOpacity_SetsAlphaFromPercent();
+    Test_BuildSettings_NewFieldsDefaultWhenNotProvided();
+    Test_BuildSettings_NewFieldsAppliedWhenProvided();
     Test_ComputePanelPosition_StandardDpi();
     Test_ComputePanelPosition_ScaledDpi();
     Test_ComputePanelPosition_SecondMonitorOffset();
