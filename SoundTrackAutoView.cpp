@@ -578,6 +578,7 @@ void SendPreviousTrackCommand() {
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <windowsx.h>
 
 static const wchar_t kOsdWindowClassName[] = L"SoundTrackAutoViewOsdWindow";
 
@@ -791,9 +792,103 @@ static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
     ReleaseDC(nullptr, screenDc);
 }
 
+static constexpr UINT_PTR kFadeTimerId = 1;
+static constexpr UINT_PTR kAutoHideTimerId = 2;
+static constexpr UINT kFadeTimerIntervalMs = 15;
+static constexpr double kFadeInSeconds = 0.15;
+static constexpr double kFadeOutSeconds = 0.20;
+
+static OsdTimingController g_timingController(4.0);
+static bool g_fadingIn = false;
+static bool g_fadingOut = false;
+
+static double NowInSeconds() {
+    return GetTickCount64() / 1000.0;
+}
+
+static void StepFadeAnimation(HWND hwnd) {
+    double step = kFadeTimerIntervalMs / 1000.0;
+    if (g_fadingIn) {
+        g_currentAlpha += static_cast<float>(step / kFadeInSeconds);
+        if (g_currentAlpha >= 1.0f) {
+            g_currentAlpha = 1.0f;
+            g_fadingIn = false;
+            KillTimer(hwnd, kFadeTimerId);
+        }
+    } else if (g_fadingOut) {
+        g_currentAlpha -= static_cast<float>(step / kFadeOutSeconds);
+        if (g_currentAlpha <= 0.0f) {
+            g_currentAlpha = 0.0f;
+            g_fadingOut = false;
+            KillTimer(hwnd, kFadeTimerId);
+            ShowWindow(hwnd, SW_HIDE);
+            g_timingController.MarkHidden();
+            return;
+        }
+    }
+    PaintOsdContent(hwnd, g_currentLayout, g_currentPalette, g_currentSnapshot,
+                    g_currentAlpha);
+}
+
+static void StartHideAnimation(HWND hwnd) {
+    KillTimer(hwnd, kAutoHideTimerId);
+    g_fadingIn = false;
+    g_fadingOut = true;
+    SetTimer(hwnd, kFadeTimerId, kFadeTimerIntervalMs, nullptr);
+}
+
 static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                     LPARAM lParam) {
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+    switch (msg) {
+        case WM_TIMER: {
+            if (wParam == kFadeTimerId) {
+                StepFadeAnimation(hwnd);
+                return 0;
+            }
+            if (wParam == kAutoHideTimerId) {
+                if (g_timingController.ShouldHideNow(NowInSeconds())) {
+                    KillTimer(hwnd, kAutoHideTimerId);
+                    StartHideAnimation(hwnd);
+                }
+                return 0;
+            }
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tme);
+            g_timingController.OnMouseEnter(NowInSeconds());
+            return 0;
+        }
+        case WM_MOUSELEAVE: {
+            g_timingController.OnMouseLeave(NowInSeconds());
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            PanelLayout panelForButtons{0, 0, g_currentLayout.width,
+                                         g_currentLayout.height};
+            ButtonLayout buttons = ComputeButtonLayout(panelForButtons);
+            POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            switch (HitTestButton(buttons, pt)) {
+                case OsdButton::Previous:
+                    SendPreviousTrackCommand();
+                    break;
+                case OsdButton::PlayPause:
+                    SendPlayPauseCommand();
+                    break;
+                case OsdButton::Next:
+                    SendNextTrackCommand();
+                    break;
+                case OsdButton::None:
+                    break;
+            }
+            g_timingController.OnTrigger(NowInSeconds());
+            SetTimer(hwnd, kAutoHideTimerId, 100, nullptr);
+            return 0;
+        }
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
 }
 
 HWND CreateOsdWindow(HINSTANCE hInstance) {
@@ -847,6 +942,37 @@ void UpdateOsdContent(HWND hwnd, const TrackSnapshot& snapshot) {
 
     PaintOsdContent(hwnd, g_currentLayout, g_currentPalette, g_currentSnapshot,
                     g_currentAlpha);
+}
+
+void TriggerOsdDisplay(const TrackSnapshot& snapshot) {
+    double now = NowInSeconds();
+    auto result = g_timingController.OnTrigger(now);
+
+    UpdateOsdContent(g_osdWindow, snapshot);
+
+    if (result.shouldPlayFadeIn) {
+        ShowWindow(g_osdWindow, SW_SHOWNOACTIVATE);
+        g_currentAlpha = 0.0f;
+        g_fadingIn = true;
+        g_fadingOut = false;
+        SetTimer(g_osdWindow, kFadeTimerId, kFadeTimerIntervalMs, nullptr);
+    } else {
+        g_currentAlpha = 1.0f;
+        PaintOsdContent(g_osdWindow, g_currentLayout, g_currentPalette,
+                        g_currentSnapshot, g_currentAlpha);
+    }
+
+    SetTimer(g_osdWindow, kAutoHideTimerId, 100, nullptr);
+}
+
+void ApplySmtcCorrection(const TrackSnapshot& snapshot) {
+    double now = NowInSeconds();
+    if (!g_timingController.OnSmtcUpdate(now)) {
+        return;
+    }
+    UpdateOsdContent(g_osdWindow, snapshot);
+    PaintOsdContent(g_osdWindow, g_currentLayout, g_currentPalette,
+                    g_currentSnapshot, g_currentAlpha);
 }
 
 BOOL Wh_ModInit() {
