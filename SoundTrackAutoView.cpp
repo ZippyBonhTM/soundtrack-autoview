@@ -575,6 +575,280 @@ void SendPreviousTrackCommand() {
     }
 }
 
+#include <d2d1.h>
+#include <dwrite.h>
+#include <dwmapi.h>
+
+static const wchar_t kOsdWindowClassName[] = L"SoundTrackAutoViewOsdWindow";
+
+static winrt::com_ptr<ID2D1Factory> g_d2dFactory;
+static winrt::com_ptr<IDWriteFactory> g_dwriteFactory;
+static HWND g_osdWindow = nullptr;
+static PanelLayout g_currentLayout;
+static ThemePalette g_currentPalette;
+static TrackSnapshot g_currentSnapshot;
+static float g_currentAlpha = 1.0f;
+
+static void EnsureGraphicsFactories() {
+    if (!g_d2dFactory) {
+        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2dFactory.put());
+    }
+    if (!g_dwriteFactory) {
+        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                             reinterpret_cast<IUnknown**>(g_dwriteFactory.put()));
+    }
+}
+
+static bool IsSystemInDarkMode() {
+    HKEY key;
+    if (RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0,
+            KEY_READ, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD value = 1;
+    DWORD size = sizeof(value);
+    DWORD type = REG_DWORD;
+    LONG result = RegQueryValueExW(key, L"AppsUseLightTheme", nullptr, &type,
+                                    reinterpret_cast<BYTE*>(&value), &size);
+    RegCloseKey(key);
+    if (result != ERROR_SUCCESS) {
+        return false;
+    }
+    return value == 0;  // AppsUseLightTheme == 0 means dark mode
+}
+
+static void DrawMusicNotePlaceholder(ID2D1DCRenderTarget* dcTarget,
+                                      const D2D1_RECT_F& rect,
+                                      ID2D1SolidColorBrush* brush) {
+    float size = rect.bottom - rect.top;
+    float noteHeadRadius = size * 0.14f;
+    float stemWidth = size * 0.07f;
+    float stemHeight = size * 0.55f;
+
+    float centerX = rect.left + size * 0.42f;
+    float centerY = rect.bottom - size * 0.22f;
+
+    D2D1_ELLIPSE noteHead =
+        D2D1::Ellipse(D2D1::Point2F(centerX, centerY), noteHeadRadius, noteHeadRadius);
+    dcTarget->FillEllipse(noteHead, brush);
+
+    D2D1_RECT_F stem =
+        D2D1::RectF(centerX + noteHeadRadius - stemWidth, centerY - stemHeight,
+                    centerX + noteHeadRadius, centerY);
+    dcTarget->FillRectangle(stem, brush);
+
+    D2D1_RECT_F flag = D2D1::RectF(centerX + noteHeadRadius - stemWidth,
+                                    centerY - stemHeight,
+                                    centerX + noteHeadRadius + size * 0.16f,
+                                    centerY - stemHeight * 0.65f);
+    dcTarget->FillRectangle(flag, brush);
+}
+
+static void PaintOsdContent(HWND hwnd, const PanelLayout& layout,
+                             const ThemePalette& palette,
+                             const TrackSnapshot& snapshot, float alpha) {
+    EnsureGraphicsFactories();
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = layout.width;
+    bmi.bmiHeader.biHeight = -layout.height;  // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HDC screenDc = GetDC(nullptr);
+    HDC memDc = CreateCompatibleDC(screenDc);
+    HBITMAP bitmap = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP oldBitmap = static_cast<HBITMAP>(SelectObject(memDc, bitmap));
+
+    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    winrt::com_ptr<ID2D1DCRenderTarget> dcTarget;
+    g_d2dFactory->CreateDCRenderTarget(&rtProps, dcTarget.put());
+
+    RECT bindRect{0, 0, layout.width, layout.height};
+    dcTarget->BindDC(memDc, &bindRect);
+
+    dcTarget->BeginDraw();
+    dcTarget->Clear(D2D1::ColorF(palette.background.r, palette.background.g,
+                                  palette.background.b, palette.background.a));
+
+    winrt::com_ptr<ID2D1SolidColorBrush> textBrush;
+    dcTarget->CreateSolidColorBrush(
+        D2D1::ColorF(palette.text.r, palette.text.g, palette.text.b, palette.text.a),
+        textBrush.put());
+
+    winrt::com_ptr<ID2D1SolidColorBrush> textSecondaryBrush;
+    dcTarget->CreateSolidColorBrush(
+        D2D1::ColorF(palette.textSecondary.r, palette.textSecondary.g,
+                     palette.textSecondary.b, palette.textSecondary.a),
+        textSecondaryBrush.put());
+
+    winrt::com_ptr<ID2D1SolidColorBrush> accentBrush;
+    dcTarget->CreateSolidColorBrush(
+        D2D1::ColorF(palette.accent.r, palette.accent.g, palette.accent.b,
+                     palette.accent.a),
+        accentBrush.put());
+
+    winrt::com_ptr<IDWriteTextFormat> titleFormat;
+    g_dwriteFactory->CreateTextFormat(
+        L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"en-us",
+        titleFormat.put());
+
+    winrt::com_ptr<IDWriteTextFormat> artistFormat;
+    g_dwriteFactory->CreateTextFormat(
+        L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us",
+        artistFormat.put());
+
+    float artSize = static_cast<float>(layout.height) - 24.0f;
+    D2D1_RECT_F artRect = D2D1::RectF(12.0f, 12.0f, 12.0f + artSize, 12.0f + artSize);
+
+    if (!snapshot.artPixelsBgra.empty()) {
+        winrt::com_ptr<ID2D1Bitmap> artBitmap;
+        D2D1_BITMAP_PROPERTIES bitmapProps = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                               D2D1_ALPHA_MODE_PREMULTIPLIED));
+        HRESULT hr = dcTarget->CreateBitmap(
+            D2D1::SizeU(static_cast<UINT32>(snapshot.artWidth),
+                        static_cast<UINT32>(snapshot.artHeight)),
+            snapshot.artPixelsBgra.data(),
+            static_cast<UINT32>(snapshot.artWidth) * 4, bitmapProps, artBitmap.put());
+        if (SUCCEEDED(hr)) {
+            dcTarget->DrawBitmap(artBitmap.get(), artRect);
+        }
+    } else {
+        winrt::com_ptr<ID2D1SolidColorBrush> placeholderBgBrush;
+        dcTarget->CreateSolidColorBrush(
+            D2D1::ColorF(palette.textSecondary.r, palette.textSecondary.g,
+                         palette.textSecondary.b, 0.15f),
+            placeholderBgBrush.put());
+        dcTarget->FillRectangle(artRect, placeholderBgBrush.get());
+        DrawMusicNotePlaceholder(dcTarget.get(), artRect, textSecondaryBrush.get());
+    }
+
+    float textLeft = artRect.right + 12.0f;
+    D2D1_RECT_F titleRect =
+        D2D1::RectF(textLeft, 14.0f, static_cast<float>(layout.width) - 12.0f, 34.0f);
+    D2D1_RECT_F artistRect =
+        D2D1::RectF(textLeft, 36.0f, static_cast<float>(layout.width) - 12.0f, 54.0f);
+
+    dcTarget->DrawText(snapshot.title.c_str(),
+                        static_cast<UINT32>(snapshot.title.size()), titleFormat.get(),
+                        titleRect, textBrush.get());
+    dcTarget->DrawText(snapshot.artist.c_str(),
+                        static_cast<UINT32>(snapshot.artist.size()),
+                        artistFormat.get(), artistRect, textSecondaryBrush.get());
+
+    PanelLayout panelForButtons{0, 0, layout.width, layout.height};
+    ButtonLayout buttons = ComputeButtonLayout(panelForButtons);
+
+    auto drawButton = [&](const RECT& r, const wchar_t* glyph) {
+        D2D1_ELLIPSE circle = D2D1::Ellipse(
+            D2D1::Point2F((r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f),
+            (r.right - r.left) / 2.0f, (r.bottom - r.top) / 2.0f);
+        dcTarget->FillEllipse(circle, accentBrush.get());
+
+        D2D1_RECT_F glyphRect =
+            D2D1::RectF(static_cast<float>(r.left), static_cast<float>(r.top),
+                        static_cast<float>(r.right), static_cast<float>(r.bottom));
+        winrt::com_ptr<IDWriteTextFormat> glyphFormat;
+        g_dwriteFactory->CreateTextFormat(
+            L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us",
+            glyphFormat.put());
+        glyphFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        glyphFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        dcTarget->DrawText(glyph, 1, glyphFormat.get(), glyphRect, textBrush.get());
+    };
+
+    drawButton(buttons.previous, L"");
+    drawButton(buttons.playPause,
+               snapshot.status == PlaybackState::Playing ? L"" : L"");
+    drawButton(buttons.next, L"");
+
+    dcTarget->EndDraw();
+
+    POINT sourcePoint{0, 0};
+    POINT windowPos{layout.x, layout.y};
+    SIZE windowSize{layout.width, layout.height};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0,
+                         static_cast<BYTE>(255.0f * alpha), AC_SRC_ALPHA};
+
+    UpdateLayeredWindow(hwnd, screenDc, &windowPos, &windowSize, memDc, &sourcePoint,
+                         0, &blend, ULW_ALPHA);
+
+    SelectObject(memDc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memDc);
+    ReleaseDC(nullptr, screenDc);
+}
+
+static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                    LPARAM lParam) {
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+HWND CreateOsdWindow(HINSTANCE hInstance) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = OsdWndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = kOsdWindowClassName;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&wc);
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        kOsdWindowClassName, L"SoundTrackAutoView", WS_POPUP, 0, 0, 1, 1, nullptr,
+        nullptr, hInstance, nullptr);
+
+    if (hwnd) {
+        DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
+        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner,
+                               sizeof(corner));
+
+        DWM_SYSTEMBACKDROP_TYPE backdrop = DWMSBT_TRANSIENTWINDOW;
+        DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop,
+                               sizeof(backdrop));
+    }
+
+    return hwnd;
+}
+
+void UpdateOsdContent(HWND hwnd, const TrackSnapshot& snapshot) {
+    g_currentSnapshot = snapshot;
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    GetMonitorInfoW(monitor, &monitorInfo);
+
+    UINT dpi = GetDpiForWindow(hwnd);
+    if (dpi == 0) dpi = 96;
+
+    g_currentLayout = ComputePanelPosition(monitorInfo.rcWork, dpi);
+
+    auto settings = GetCurrentSettings();
+    bool systemIsDark = IsSystemInDarkMode();
+    ThemePalette customPalette{settings->customBackground, settings->customText,
+                                settings->customText, settings->customAccent};
+    g_currentPalette = ResolvePalette(settings->theme, systemIsDark, customPalette);
+
+    SetWindowPos(hwnd, HWND_TOPMOST, g_currentLayout.x, g_currentLayout.y,
+                 g_currentLayout.width, g_currentLayout.height, SWP_NOACTIVATE);
+
+    PaintOsdContent(hwnd, g_currentLayout, g_currentPalette, g_currentSnapshot,
+                    g_currentAlpha);
+}
+
 BOOL Wh_ModInit() {
     Wh_Log(L"SoundTrackAutoView: init");
     RefreshSettingsFromWindhawk();
