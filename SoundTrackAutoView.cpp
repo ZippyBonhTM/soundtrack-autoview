@@ -975,12 +975,94 @@ void ApplySmtcCorrection(const TrackSnapshot& snapshot) {
                     g_currentSnapshot, g_currentAlpha);
 }
 
+static constexpr UINT kOsdCorrectionMessage = WM_APP + 2;
+
+static HANDLE g_osdThreadHandle = nullptr;
+static winrt::event_token g_playbackInfoToken;
+static winrt::event_token g_propertiesToken;
+static GlobalSystemMediaTransportControlsSession g_subscribedSession{nullptr};
+
+static void EnsureSmtcSubscription() {
+    if (!EnsureSessionManager()) return;
+    auto session = g_sessionManager.GetCurrentSession();
+    if (!session || session == g_subscribedSession) return;
+
+    g_subscribedSession = session;
+    g_playbackInfoToken = session.PlaybackInfoChanged([](auto&&, auto&&) {
+        DWORD threadId = g_osdThreadId.load();
+        if (threadId != 0) {
+            PostThreadMessageW(threadId, kOsdCorrectionMessage, 0, 0);
+        }
+    });
+    g_propertiesToken = session.MediaPropertiesChanged([](auto&&, auto&&) {
+        DWORD threadId = g_osdThreadId.load();
+        if (threadId != 0) {
+            PostThreadMessageW(threadId, kOsdCorrectionMessage, 0, 0);
+        }
+    });
+}
+
+static DWORD WINAPI OsdThreadProc(LPVOID) {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+
+    g_osdWindow = CreateOsdWindow(GetModuleHandleW(nullptr));
+
+    MSG msg;
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);  // ensure a message queue exists
+    g_osdThreadId.store(GetCurrentThreadId());
+
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == kOsdTriggerMessage) {
+            auto settings = GetCurrentSettings();
+            g_timingController = OsdTimingController(settings->durationSeconds);
+
+            auto snapshot = TryGetCurrentTrackSnapshot();
+            if (ShouldShowPanel(snapshot)) {
+                EnsureSmtcSubscription();
+                TriggerOsdDisplay(*snapshot);
+            }
+        } else if (msg.message == kOsdCorrectionMessage) {
+            auto snapshot = TryGetCurrentTrackSnapshot();
+            if (ShouldShowPanel(snapshot)) {
+                ApplySmtcCorrection(*snapshot);
+            }
+        } else {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    if (g_osdWindow) {
+        DestroyWindow(g_osdWindow);
+        g_osdWindow = nullptr;
+    }
+    winrt::uninit_apartment();
+    return 0;
+}
+
 BOOL Wh_ModInit() {
     Wh_Log(L"SoundTrackAutoView: init");
+
     RefreshSettingsFromWindhawk();
 
     if (!InstallKeyboardHook()) {
         return FALSE;
+    }
+
+    g_osdThreadHandle = CreateThread(nullptr, 0, OsdThreadProc, nullptr, 0, nullptr);
+    if (!g_osdThreadHandle) {
+        Wh_Log(L"SoundTrackAutoView: failed to create OSD thread, error %lu",
+               GetLastError());
+        UninstallKeyboardHook();
+        return FALSE;
+    }
+
+    // Wait briefly for the OSD thread to publish its thread id before
+    // returning, so a media key pressed immediately after mod load isn't
+    // dropped (PostThreadMessage silently fails if the thread id is 0 or
+    // doesn't have a message queue yet).
+    for (int i = 0; i < 50 && g_osdThreadId.load() == 0; i++) {
+        Sleep(10);
     }
 
     return TRUE;
@@ -988,7 +1070,25 @@ BOOL Wh_ModInit() {
 
 void Wh_ModUninit() {
     Wh_Log(L"SoundTrackAutoView: uninit");
+
     UninstallKeyboardHook();
+
+    DWORD threadId = g_osdThreadId.load();
+    if (threadId != 0) {
+        PostThreadMessageW(threadId, WM_QUIT, 0, 0);
+    }
+    if (g_osdThreadHandle) {
+        WaitForSingleObject(g_osdThreadHandle, 2000);
+        CloseHandle(g_osdThreadHandle);
+        g_osdThreadHandle = nullptr;
+    }
+
+    if (g_subscribedSession) {
+        g_subscribedSession.PlaybackInfoChanged(g_playbackInfoToken);
+        g_subscribedSession.MediaPropertiesChanged(g_propertiesToken);
+        g_subscribedSession = nullptr;
+    }
+    g_sessionManager = nullptr;
 }
 
 void Wh_ModSettingsChanged() {
