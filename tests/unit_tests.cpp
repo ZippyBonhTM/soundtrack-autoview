@@ -174,6 +174,66 @@ static void Test_HitTestButton_OutsideAnyButton() {
     CHECK(HitTestButton(buttons, farCorner) == OsdButton::None);
 }
 
+static void Test_OsdTimingController_FirstTriggerPlaysFadeIn() {
+    OsdTimingController controller(4.0);
+    auto result = controller.OnTrigger(0.0);
+    CHECK(result.shouldPlayFadeIn);
+    CHECK(controller.IsVisible());
+}
+
+static void Test_OsdTimingController_SecondTriggerWhileVisibleSkipsFadeIn() {
+    OsdTimingController controller(4.0);
+    controller.OnTrigger(0.0);
+    auto result = controller.OnTrigger(0.5);
+    CHECK(!result.shouldPlayFadeIn);
+}
+
+static void Test_OsdTimingController_HidesAfterDuration() {
+    OsdTimingController controller(4.0);
+    controller.OnTrigger(0.0);
+    CHECK(!controller.ShouldHideNow(3.9));
+    CHECK(controller.ShouldHideNow(4.0));
+}
+
+static void Test_OsdTimingController_SecondTriggerResetsHideDeadline() {
+    OsdTimingController controller(4.0);
+    controller.OnTrigger(0.0);
+    controller.OnTrigger(2.0);
+    CHECK(!controller.ShouldHideNow(4.0));  // would have fired under the first trigger
+    CHECK(controller.ShouldHideNow(6.0));
+}
+
+static void Test_OsdTimingController_SmtcUpdateOnlyAppliesWithinCorrectionWindow() {
+    OsdTimingController controller(4.0, 1.0);
+    controller.OnTrigger(0.0);
+    CHECK(controller.OnSmtcUpdate(0.5));
+    CHECK(!controller.OnSmtcUpdate(1.5));
+}
+
+static void Test_OsdTimingController_HoverPausesCountdown() {
+    OsdTimingController controller(4.0);
+    controller.OnTrigger(0.0);
+    controller.OnMouseEnter(1.0);
+    CHECK(!controller.ShouldHideNow(10.0));
+}
+
+static void Test_OsdTimingController_MouseLeaveResumesFromFullDuration() {
+    OsdTimingController controller(4.0);
+    controller.OnTrigger(0.0);
+    controller.OnMouseEnter(1.0);
+    controller.OnMouseLeave(10.0);
+    CHECK(!controller.ShouldHideNow(13.9));
+    CHECK(controller.ShouldHideNow(14.0));
+}
+
+static void Test_OsdTimingController_RetriggerAfterHideReplaysFadeIn() {
+    OsdTimingController controller(4.0);
+    controller.OnTrigger(0.0);
+    controller.MarkHidden();
+    auto result = controller.OnTrigger(10.0);
+    CHECK(result.shouldPlayFadeIn);
+}
+
 int main() {
     Test_HarnessSmokeTest();
     Test_TryParseHexColor_ValidSixDigit();
@@ -197,6 +257,14 @@ int main() {
     Test_ComputeButtonLayout_ThreeDistinctRegions();
     Test_HitTestButton_InsideEachButton();
     Test_HitTestButton_OutsideAnyButton();
+    Test_OsdTimingController_FirstTriggerPlaysFadeIn();
+    Test_OsdTimingController_SecondTriggerWhileVisibleSkipsFadeIn();
+    Test_OsdTimingController_HidesAfterDuration();
+    Test_OsdTimingController_SecondTriggerResetsHideDeadline();
+    Test_OsdTimingController_SmtcUpdateOnlyAppliesWithinCorrectionWindow();
+    Test_OsdTimingController_HoverPausesCountdown();
+    Test_OsdTimingController_MouseLeaveResumesFromFullDuration();
+    Test_OsdTimingController_RetriggerAfterHideReplaysFadeIn();
 
     wprintf(L"\n%d/%d tests passed\n", g_testsRun - g_testsFailed, g_testsRun);
     return g_testsFailed == 0 ? 0 : 1;

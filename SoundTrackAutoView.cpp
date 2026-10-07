@@ -259,6 +259,62 @@ inline OsdButton HitTestButton(const ButtonLayout& buttons, POINT pt) {
     return OsdButton::None;
 }
 
+class OsdTimingController {
+public:
+    explicit OsdTimingController(double durationSeconds,
+                                  double correctionWindowSeconds = 1.0)
+        : durationSeconds_(durationSeconds),
+          correctionWindowSeconds_(correctionWindowSeconds) {}
+
+    struct TriggerResult {
+        bool shouldPlayFadeIn = false;
+    };
+
+    TriggerResult OnTrigger(double nowSeconds) {
+        TriggerResult result;
+        result.shouldPlayFadeIn = !visible_;
+        visible_ = true;
+        hovered_ = false;
+        hideDeadlineSeconds_ = nowSeconds + durationSeconds_;
+        correctionDeadlineSeconds_ = nowSeconds + correctionWindowSeconds_;
+        return result;
+    }
+
+    bool OnSmtcUpdate(double nowSeconds) const {
+        return visible_ && nowSeconds <= correctionDeadlineSeconds_;
+    }
+
+    void OnMouseEnter(double /*nowSeconds*/) {
+        hovered_ = true;
+    }
+
+    void OnMouseLeave(double nowSeconds) {
+        hovered_ = false;
+        hideDeadlineSeconds_ = nowSeconds + durationSeconds_;
+    }
+
+    bool ShouldHideNow(double nowSeconds) const {
+        return visible_ && !hovered_ && nowSeconds >= hideDeadlineSeconds_;
+    }
+
+    bool IsVisible() const {
+        return visible_;
+    }
+
+    void MarkHidden() {
+        visible_ = false;
+        hovered_ = false;
+    }
+
+private:
+    double durationSeconds_;
+    double correctionWindowSeconds_;
+    bool visible_ = false;
+    bool hovered_ = false;
+    double hideDeadlineSeconds_ = 0.0;
+    double correctionDeadlineSeconds_ = 0.0;
+};
+
 // ---------------------------------------------------------------------------
 // Windhawk mod entry points and OS-integration code. Excluded from the unit
 // test build since they depend on the Windhawk engine (Wh_* functions) and
