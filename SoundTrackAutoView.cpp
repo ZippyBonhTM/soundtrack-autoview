@@ -322,13 +322,57 @@ private:
 // ---------------------------------------------------------------------------
 #ifndef SOUNDTRACK_AUTOVIEW_TEST_BUILD
 
+#include <memory>
+#include <mutex>
+
+static std::mutex g_settingsMutex;
+static std::shared_ptr<const ModSettings> g_settings =
+    std::make_shared<const ModSettings>();
+
+std::shared_ptr<const ModSettings> GetCurrentSettings() {
+    std::lock_guard<std::mutex> lock(g_settingsMutex);
+    return g_settings;
+}
+
+void RefreshSettingsFromWindhawk() {
+    int rawDuration = Wh_GetIntSetting(L"duration");
+
+    PCWSTR rawTheme = Wh_GetStringSetting(L"theme");
+    std::wstring theme(rawTheme);
+    Wh_FreeStringSetting(rawTheme);
+
+    PCWSTR rawBg = Wh_GetStringSetting(L"customBackgroundColor");
+    std::wstring bg(rawBg);
+    Wh_FreeStringSetting(rawBg);
+
+    PCWSTR rawText = Wh_GetStringSetting(L"customTextColor");
+    std::wstring text(rawText);
+    Wh_FreeStringSetting(rawText);
+
+    PCWSTR rawAccent = Wh_GetStringSetting(L"customAccentColor");
+    std::wstring accent(rawAccent);
+    Wh_FreeStringSetting(rawAccent);
+
+    auto settings = std::make_shared<const ModSettings>(
+        BuildSettings(rawDuration, theme, bg, text, accent));
+
+    std::lock_guard<std::mutex> lock(g_settingsMutex);
+    g_settings = settings;
+}
+
 BOOL Wh_ModInit() {
     Wh_Log(L"SoundTrackAutoView: init");
+    RefreshSettingsFromWindhawk();
     return TRUE;
 }
 
 void Wh_ModUninit() {
     Wh_Log(L"SoundTrackAutoView: uninit");
+}
+
+void Wh_ModSettingsChanged() {
+    Wh_Log(L"SoundTrackAutoView: settings changed");
+    RefreshSettingsFromWindhawk();
 }
 
 #endif  // SOUNDTRACK_AUTOVIEW_TEST_BUILD
